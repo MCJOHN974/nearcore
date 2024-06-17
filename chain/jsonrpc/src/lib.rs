@@ -23,7 +23,7 @@ use near_client_primitives::types::GetSplitStorageInfo;
 pub use near_jsonrpc_client as client;
 use near_jsonrpc_primitives::errors::RpcError;
 use near_jsonrpc_primitives::message::{Message, Request};
-use near_jsonrpc_primitives::types::config::RpcProtocolConfigResponse;
+use near_jsonrpc_primitives::types::config::{RpcProtocolConfigError, RpcProtocolConfigResponse};
 use near_jsonrpc_primitives::types::entity_debug::{EntityDebugHandler, EntityQuery};
 use near_jsonrpc_primitives::types::query::RpcQueryRequest;
 use near_jsonrpc_primitives::types::split_storage::{
@@ -37,7 +37,7 @@ use near_network::tcp;
 use near_o11y::metrics::{prometheus, Encoder, TextEncoder};
 use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::SignedTransaction;
-use near_primitives::types::{AccountId, BlockHeight};
+use near_primitives::types::{AccountId, BlockHeight, BlockId, BlockReference};
 use near_primitives::views::{QueryRequest, TxExecutionStatus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -262,6 +262,15 @@ pub struct ViewClientSenderForRpc(
     #[cfg(feature = "test_features")] Sender<near_client::NetworkAdversarialMessage>,
 );
 
+#[cfg(feature = "test_features")]
+#[derive(Clone, near_async::MultiSend, near_async::MultiSenderFrom)]
+pub struct GCSenderForRpc(
+    AsyncSender<
+        near_client::gc_actor::NetworkAdversarialMessage,
+        ActixResult<near_client::gc_actor::NetworkAdversarialMessage>,
+    >,
+);
+
 #[derive(Clone, near_async::MultiSend, near_async::MultiSenderFrom)]
 pub struct PeerManagerSenderForRpc(AsyncSender<GetDebugStatus, ActixResult<GetDebugStatus>>);
 
@@ -269,6 +278,8 @@ struct JsonRpcHandler {
     client_sender: ClientSenderForRpc,
     view_client_sender: ViewClientSenderForRpc,
     peer_manager_sender: PeerManagerSenderForRpc,
+    #[cfg(feature = "test_features")]
+    gc_sender: GCSenderForRpc,
     polling_config: RpcPollingConfig,
     genesis_config: GenesisConfig,
     enable_debug_rpc: bool,
@@ -400,6 +411,9 @@ impl JsonRpcHandler {
             "EXPERIMENTAL_changes_in_block" => {
                 process_method_call(request, |params| self.changes_in_block(params)).await
             }
+            "EXPERIMENTAL_congestion_level" => {
+                process_method_call(request, |params| self.congestion_level(params)).await
+            }
             "EXPERIMENTAL_genesis_config" => {
                 process_method_call(request, |_params: ()| async {
                     Result::<_, std::convert::Infallible>::Ok(&self.genesis_config)
@@ -411,6 +425,9 @@ impl JsonRpcHandler {
                     self.light_client_execution_outcome_proof(params)
                 })
                 .await
+            }
+            "EXPERIMENTAL_light_client_block_proof" => {
+                process_method_call(request, |params| self.light_client_block_proof(params)).await
             }
             "EXPERIMENTAL_protocol_config" => {
                 process_method_call(request, |params| self.protocol_config(params)).await
@@ -466,6 +483,7 @@ impl JsonRpcHandler {
             "adv_disable_header_sync" => self.adv_disable_header_sync(request.params).await,
             "adv_disable_doomslug" => self.adv_disable_doomslug(request.params).await,
             "adv_produce_blocks" => self.adv_produce_blocks(request.params).await,
+            "adv_produce_chunks" => self.adv_produce_chunks(request.params).await,
             "adv_switch_to_height" => self.adv_switch_to_height(request.params).await,
             "adv_get_saved_blocks" => self.adv_get_saved_blocks(request.params).await,
             "adv_check_store" => self.adv_check_store(request.params).await,
@@ -473,11 +491,12 @@ impl JsonRpcHandler {
         })
     }
 
-    async fn client_send<M, R: Send + 'static, F: Send + 'static, E>(&self, msg: M) -> Result<R, E>
+    async fn client_send<M, R, F, E>(&self, msg: M) -> Result<R, E>
     where
         ClientSenderForRpc: CanSend<MessageWithCallback<M, Result<R, F>>>,
-        E: RpcFrom<F>,
-        E: RpcFrom<AsyncSendError>,
+        R: Send + 'static,
+        F: Send + 'static,
+        E: RpcFrom<F> + RpcFrom<AsyncSendError>,
     {
         self.client_sender
             .send_async(msg)
@@ -486,14 +505,12 @@ impl JsonRpcHandler {
             .map_err(RpcFrom::rpc_from)
     }
 
-    async fn view_client_send<M, T: Send + 'static, E, F: Send + 'static>(
-        &self,
-        msg: M,
-    ) -> Result<T, E>
+    async fn view_client_send<M, T, E, F>(&self, msg: M) -> Result<T, E>
     where
         ViewClientSenderForRpc: CanSend<MessageWithCallback<M, Result<T, F>>>,
-        E: RpcFrom<F>,
-        E: RpcFrom<AsyncSendError>,
+        T: Send + 'static,
+        E: RpcFrom<AsyncSendError> + RpcFrom<F>,
+        F: Send + 'static,
     {
         self.view_client_sender
             .send_async(msg)
@@ -502,13 +519,11 @@ impl JsonRpcHandler {
             .map_err(RpcFrom::rpc_from)
     }
 
-    async fn peer_manager_send<M, T: Send + 'static, E: Send + 'static>(
-        &self,
-        msg: M,
-    ) -> Result<T, E>
+    async fn peer_manager_send<M, T, E>(&self, msg: M) -> Result<T, E>
     where
         PeerManagerSenderForRpc: CanSend<MessageWithCallback<M, T>>,
-        E: RpcFrom<AsyncSendError>,
+        T: Send + 'static,
+        E: RpcFrom<AsyncSendError> + Send + 'static,
     {
         self.peer_manager_sender.send_async(msg).await.map_err(RpcFrom::rpc_from)
     }
@@ -628,10 +643,11 @@ impl JsonRpcHandler {
         .map_err(|_| {
             metrics::RPC_TIMEOUT_TOTAL.inc();
             tracing::warn!(
-                target: "jsonrpc", "Timeout: tx_status_fetch method. tx_info {:?} fetch_receipt {:?} result {:?}",
+                target: "jsonrpc", "Timeout: tx_status_fetch method. tx_info {:?} fetch_receipt {:?} result {:?} timeout {:?}",
                 tx_info,
                 fetch_receipt,
-                tx_status_result
+                tx_status_result,
+                self.polling_config.polling_timeout,
             );
             near_jsonrpc_primitives::types::transactions::RpcTransactionError::TimeoutError
         })?
@@ -647,7 +663,7 @@ impl JsonRpcHandler {
     ) -> Result<ProcessTxResponse, near_jsonrpc_primitives::types::transactions::RpcTransactionError>
     {
         let tx_hash = tx.get_hash();
-        let signer_account_id = tx.transaction.signer_id.clone();
+        let signer_account_id = tx.transaction.signer_id().clone();
         let response = self
             .client_sender
             .send_async(ProcessTxRequest { transaction: tx, is_forwarded: false, check_only })
@@ -711,8 +727,7 @@ impl JsonRpcHandler {
     > {
         self.send_tx(RpcSendTransactionRequest {
             signed_transaction: request_data.signed_transaction,
-            // Will be ignored, broadcast_tx_commit is not aligned with existing enum
-            wait_until: Default::default(),
+            wait_until: TxExecutionStatus::ExecutedOptimistic,
         })
         .await
     }
@@ -905,6 +920,41 @@ impl JsonRpcHandler {
         Ok(near_jsonrpc_primitives::types::chunks::RpcChunkResponse { chunk_view })
     }
 
+    async fn congestion_level(
+        &self,
+        request_data: near_jsonrpc_primitives::types::congestion::RpcCongestionLevelRequest,
+    ) -> Result<
+        near_jsonrpc_primitives::types::congestion::RpcCongestionLevelResponse,
+        near_jsonrpc_primitives::types::congestion::RpcCongestionLevelError,
+    > {
+        let chunk_view =
+            self.view_client_send(GetChunk::rpc_from(request_data.chunk_reference)).await?;
+        let config_result = self
+            .view_client_send(GetProtocolConfig(BlockReference::BlockId(BlockId::Height(
+                chunk_view.header.height_included,
+            ))))
+            .await;
+        let config = config_result.map_err(|err: RpcProtocolConfigError| match err {
+            RpcProtocolConfigError::UnknownBlock { error_message } => {
+                near_jsonrpc_primitives::types::congestion::RpcCongestionLevelError::UnknownBlock {
+                    error_message,
+                }
+            }
+            RpcProtocolConfigError::InternalError { error_message } => {
+                near_jsonrpc_primitives::types::congestion::RpcCongestionLevelError::InternalError {
+                    error_message,
+                }
+            }
+        })?;
+        let congestion_info = chunk_view.header.congestion_info;
+        let congestion_level = congestion_info
+            .map(|info| info.congestion_level(config.runtime_config.congestion_control_config))
+            .unwrap_or(0.0);
+        Ok(near_jsonrpc_primitives::types::congestion::RpcCongestionLevelResponse {
+            congestion_level,
+        })
+    }
+
     async fn receipt(
         &self,
         request_data: near_jsonrpc_primitives::types::receipts::RpcReceiptRequest,
@@ -1008,6 +1058,28 @@ impl JsonRpcHandler {
         Ok(near_jsonrpc_primitives::types::light_client::RpcLightClientExecutionProofResponse {
             outcome_proof: execution_outcome_proof.outcome_proof,
             outcome_root_proof: execution_outcome_proof.outcome_root_proof,
+            block_header_lite: block_proof.block_header_lite,
+            block_proof: block_proof.proof,
+        })
+    }
+
+    async fn light_client_block_proof(
+        &self,
+        request: near_jsonrpc_primitives::types::light_client::RpcLightClientBlockProofRequest,
+    ) -> Result<
+        near_jsonrpc_primitives::types::light_client::RpcLightClientBlockProofResponse,
+        near_jsonrpc_primitives::types::light_client::RpcLightClientProofError,
+    > {
+        let near_jsonrpc_primitives::types::light_client::RpcLightClientBlockProofRequest {
+            block_hash,
+            light_client_head,
+        } = request;
+
+        let block_proof: near_client_primitives::types::GetBlockProofResponse = self
+            .view_client_send(GetBlockProof { block_hash, head_block_hash: light_client_head })
+            .await?;
+
+        Ok(near_jsonrpc_primitives::types::light_client::RpcLightClientBlockProofResponse {
             block_header_lite: block_proof.block_header_lite,
             block_proof: block_proof.proof,
         })
@@ -1228,6 +1300,12 @@ impl JsonRpcHandler {
         Ok(Value::String(String::new()))
     }
 
+    async fn adv_produce_chunks(&self, params: Value) -> Result<Value, RpcError> {
+        let mode = crate::api::Params::parse(params)?;
+        self.client_sender.send(near_client::NetworkAdversarialMessage::AdvProduceChunks(mode));
+        Ok(Value::String(String::new()))
+    }
+
     async fn adv_switch_to_height(&self, params: Value) -> Result<Value, RpcError> {
         let (height,) = crate::api::Params::parse(params)?;
         self.client_sender.send(near_client::NetworkAdversarialMessage::AdvSwitchToHeight(height));
@@ -1250,8 +1328,15 @@ impl JsonRpcHandler {
         }
     }
 
+    /// First, stop GC by sending a message to GC Actor. Then run store validator inside Client.
+    /// After store validator is done, resume GC by sending another message to GC Actor.
+    /// This ensures that store validator is not run concurrently with another thread that may modify storage.
     async fn adv_check_store(&self, _params: Value) -> Result<Value, RpcError> {
-        match self
+        self.gc_sender
+            .send_async(near_client::gc_actor::NetworkAdversarialMessage::StopGC)
+            .await
+            .map_err(|_| RpcError::server_error::<String>(None))?;
+        let ret_val = match self
             .client_sender
             .send_async(near_client::NetworkAdversarialMessage::AdvCheckStorageConsistency)
             .await
@@ -1261,7 +1346,12 @@ impl JsonRpcHandler {
                 None => Err(RpcError::server_error::<String>(None)),
             },
             _ => Err(RpcError::server_error::<String>(None)),
-        }
+        }?;
+        self.gc_sender
+            .send_async(near_client::gc_actor::NetworkAdversarialMessage::ResumeGC)
+            .await
+            .map_err(|_| RpcError::server_error::<String>(None))?;
+        Ok(ret_val)
     }
 }
 
@@ -1431,6 +1521,9 @@ async fn display_debug_html(
         "validator" => Some(debug_page_string!("validator.html", handler)),
         "validator.css" => Some(debug_page_string!("validator.css", handler)),
         "split_store" => Some(debug_page_string!("split_store.html", handler)),
+        "congestion_control" => Some(debug_page_string!("congestion_control.html", handler)),
+        "congestion_control.css" => Some(debug_page_string!("congestion_control.css", handler)),
+        "congestion_control.js" => Some(debug_page_string!("congestion_control.js", handler)),
         _ => None,
     };
 
@@ -1459,6 +1552,7 @@ pub fn start_http(
     client_sender: ClientSenderForRpc,
     view_client_sender: ViewClientSenderForRpc,
     peer_manager_sender: PeerManagerSenderForRpc,
+    #[cfg(feature = "test_features")] gc_sender: GCSenderForRpc,
     entity_debug_handler: Arc<dyn EntityDebugHandler>,
 ) -> Vec<(&'static str, actix_web::dev::ServerHandle)> {
     let RpcConfig {
@@ -1486,6 +1580,8 @@ pub fn start_http(
                 enable_debug_rpc,
                 debug_pages_src_path: debug_pages_src_path.clone().map(Into::into),
                 entity_debug_handler: entity_debug_handler.clone(),
+                #[cfg(feature = "test_features")]
+                gc_sender: gc_sender.clone(),
             }))
             .app_data(web::JsonConfig::default().limit(limits_config.json_payload_max_size))
             .wrap(middleware::Logger::default())

@@ -1,7 +1,6 @@
+use crate::config::SocketOptions;
 use crate::network_protocol::testonly as data;
-use crate::network_protocol::{
-    Encoding, Handshake, PartialEdgeInfo, PeerMessage, EDGE_MIN_TIMESTAMP_NONCE,
-};
+use crate::network_protocol::{Encoding, Handshake, PartialEdgeInfo, PeerMessage};
 use crate::peer_manager::testonly::{ActorHandler, Event};
 use crate::peer_manager::{self, peer_manager_actor};
 use crate::tcp;
@@ -30,7 +29,7 @@ async fn test_nonces() {
     init_test_logger();
     let mut rng = make_rng(921853233);
     let rng = &mut rng;
-    let mut clock = time::FakeClock::new(*EDGE_MIN_TIMESTAMP_NONCE + time::Duration::days(2));
+    let mut clock = time::FakeClock::new(time::Utc::UNIX_EPOCH + time::Duration::days(2));
     let chain = Arc::new(data::Chain::make(&mut clock, rng, 10));
 
     let test_cases = [
@@ -45,8 +44,6 @@ async fn test_nonces() {
         ((i64::MAX - 1) as u64, false, "i64 max - 1"),
         (253402300799, false, "Max time"),
         (253402300799 + 2, false, "Over max time"),
-        //(Some(0), false, "Nonce 0"),
-        (1, true, "Nonce 1"),
     ];
 
     for test in test_cases {
@@ -60,7 +57,10 @@ async fn test_nonces() {
         )
         .await;
 
-        let stream = tcp::Stream::connect(&pm.peer_info(), tcp::Tier::T2).await.unwrap();
+        let stream =
+            tcp::Stream::connect(&pm.peer_info(), tcp::Tier::T2, &SocketOptions::default())
+                .await
+                .unwrap();
         let mut stream = stream::Stream::new(Some(Encoding::Proto), stream);
         let peer_key = data::make_secret_key(rng);
         let peer_id = PeerId::new(peer_key.public_key());
@@ -109,7 +109,7 @@ async fn test_nonce_refresh() {
     init_test_logger();
     let mut rng = make_rng(921853255);
     let rng = &mut rng;
-    let mut clock = time::FakeClock::new(*EDGE_MIN_TIMESTAMP_NONCE + time::Duration::days(2));
+    let mut clock = time::FakeClock::new(time::Utc::UNIX_EPOCH + time::Duration::days(2));
     let chain = Arc::new(data::Chain::make(&mut clock, rng, 10));
 
     // Start a PeerManager.
@@ -135,7 +135,7 @@ async fn test_nonce_refresh() {
     let edge = wait_for_edge(&mut pm2).await;
     let start_time = clock.now_utc();
     // First edge between them should have the nonce equal to the current time.
-    assert_eq!(Edge::nonce_to_utc(edge.nonce()).unwrap().unwrap(), start_time);
+    assert_eq!(Edge::nonce_to_utc(edge.nonce()).unwrap(), start_time);
 
     // Advance a clock by 1 hour.
     clock.advance(time::Duration::HOUR);
@@ -144,10 +144,10 @@ async fn test_nonce_refresh() {
 
     loop {
         let edge = wait_for_edge(&mut pm2).await;
-        if Edge::nonce_to_utc(edge.nonce()).unwrap().unwrap() == start_time {
+        if Edge::nonce_to_utc(edge.nonce()).unwrap() == start_time {
             tracing::debug!("Still seeing old edge..");
         } else {
-            assert_eq!(Edge::nonce_to_utc(edge.nonce()).unwrap().unwrap(), new_nonce_utc);
+            assert_eq!(Edge::nonce_to_utc(edge.nonce()).unwrap(), new_nonce_utc);
             break;
         }
     }
@@ -160,7 +160,7 @@ async fn test_nonce_refresh() {
         )
         .await;
 
-    assert_eq!(Edge::nonce_to_utc(pm2_nonce).unwrap().unwrap(), new_nonce_utc);
+    assert_eq!(Edge::nonce_to_utc(pm2_nonce).unwrap(), new_nonce_utc);
 
     let pm_nonce = pm
         .with_state(|s| async move {
@@ -168,5 +168,5 @@ async fn test_nonce_refresh() {
         })
         .await;
 
-    assert_eq!(Edge::nonce_to_utc(pm_nonce).unwrap().unwrap(), new_nonce_utc);
+    assert_eq!(Edge::nonce_to_utc(pm_nonce).unwrap(), new_nonce_utc);
 }

@@ -19,6 +19,8 @@ use crate::peer_manager::network_state::NetworkState;
 use crate::peer_manager::peer_manager_actor::Event as PME;
 use crate::shards_manager::ShardsManagerRequestFromNetwork;
 use crate::snapshot_hosts::SnapshotHostsCache;
+use crate::state_witness::PartialWitnessSenderForNetworkInput;
+use crate::state_witness::PartialWitnessSenderForNetworkMessage;
 use crate::tcp;
 use crate::test_utils;
 use crate::testonly::actix::ActixSystem;
@@ -66,10 +68,12 @@ impl actix::Handler<WithNetworkState> for PeerManagerActor {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     ShardsManager(ShardsManagerRequestFromNetwork),
     Client(ClientSenderForNetworkInput),
     PeerManager(PME),
+    PartialWitness(PartialWitnessSenderForNetworkInput),
 }
 
 pub(crate) struct ActorHandler {
@@ -177,7 +181,9 @@ impl ActorHandler {
     pub async fn send_outbound_connect(&self, peer_info: &PeerInfo, tier: tcp::Tier) {
         let addr = self.actix.addr.clone();
         let peer_info = peer_info.clone();
-        let stream = tcp::Stream::connect(&peer_info, tier).await.unwrap();
+        let stream = tcp::Stream::connect(&peer_info, tier, &config::SocketOptions::default())
+            .await
+            .unwrap();
         addr.do_send(PeerManagerMessageRequest::OutboundTcpConnect(stream).with_span_context());
     }
 
@@ -190,7 +196,9 @@ impl ActorHandler {
         let events = self.events.clone();
         let peer_info = peer_info.clone();
         async move {
-            let stream = tcp::Stream::connect(&peer_info, tier).await.unwrap();
+            let stream = tcp::Stream::connect(&peer_info, tier, &config::SocketOptions::default())
+                .await
+                .unwrap();
             let mut events = events.from_now();
             let stream_id = stream.id();
             addr.do_send(PeerManagerMessageRequest::OutboundTcpConnect(stream).with_span_context());
@@ -621,12 +629,19 @@ pub(crate) async fn start(
                     send.send(Event::ShardsManager(event));
                 }
             });
+            let state_witness_sender = Sender::from_fn({
+                let send = send.clone();
+                move |event: PartialWitnessSenderForNetworkMessage| {
+                    send.send(Event::PartialWitness(event.into_input()));
+                }
+            });
             PeerManagerActor::spawn(
                 clock,
                 store,
                 cfg,
                 client_sender.break_apart().into_multi_sender(),
                 shards_manager_sender,
+                state_witness_sender.break_apart().into_multi_sender(),
                 genesis_id,
             )
             .unwrap()

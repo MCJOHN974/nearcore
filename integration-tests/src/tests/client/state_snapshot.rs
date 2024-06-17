@@ -40,11 +40,7 @@ impl StateSnaptshotTestEnv {
         let trie_config = TrieConfig {
             shard_cache_config: trie_cache_config.clone(),
             view_shard_cache_config: trie_cache_config,
-            enable_receipt_prefetching: false,
-            sweat_prefetch_receivers: Vec::new(),
-            sweat_prefetch_senders: Vec::new(),
-            load_mem_tries_for_shards: Vec::new(),
-            load_mem_tries_for_all_shards: false,
+            ..TrieConfig::default()
         };
         let flat_storage_manager = FlatStorageManager::new(store.clone());
         let shard_uids = [ShardUId::single_shard()];
@@ -198,7 +194,8 @@ fn test_make_state_snapshot() {
         .nightshade_runtimes(&genesis)
         .build();
 
-    let signer = InMemorySigner::from_seed("test0".parse().unwrap(), KeyType::ED25519, "test0");
+    let signer: Signer =
+        InMemorySigner::from_seed("test0".parse().unwrap(), KeyType::ED25519, "test0").into();
     let genesis_block = env.clients[0].chain.get_block_by_height(0).unwrap();
     let genesis_hash = *genesis_block.hash();
 

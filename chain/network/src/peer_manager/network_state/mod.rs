@@ -18,6 +18,7 @@ use crate::routing::route_back_cache::RouteBackCache;
 use crate::routing::NetworkTopologyChange;
 use crate::shards_manager::ShardsManagerRequestFromNetwork;
 use crate::snapshot_hosts::{SnapshotHostInfoError, SnapshotHostsCache};
+use crate::state_witness::PartialWitnessSenderForNetwork;
 use crate::stats::metrics;
 use crate::store;
 use crate::tcp;
@@ -32,6 +33,7 @@ use near_primitives::network::PeerId;
 use near_primitives::types::AccountId;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -41,10 +43,6 @@ mod tier1;
 
 /// Limit number of pending Peer actors to avoid OOM.
 pub(crate) const LIMIT_PENDING_PEERS: usize = 60;
-
-/// Send important messages three times.
-/// We send these messages multiple times to reduce the chance that they are lost
-const IMPORTANT_MESSAGE_RESENT_COUNT: usize = 3;
 
 /// Size of LRU cache size of recent routed messages.
 /// It should be large enough to detect duplicates (i.e. all messages received during
@@ -99,6 +97,7 @@ pub(crate) struct NetworkState {
     pub genesis_id: GenesisId,
     pub client: ClientSenderForNetwork,
     pub shards_manager_adapter: Sender<ShardsManagerRequestFromNetwork>,
+    pub partial_witness_adapter: PartialWitnessSenderForNetwork,
 
     /// Network-related info about the chain.
     pub chain_info: ArcSwap<Option<ChainInfo>>,
@@ -167,18 +166,16 @@ impl NetworkState {
         genesis_id: GenesisId,
         client: ClientSenderForNetwork,
         shards_manager_adapter: Sender<ShardsManagerRequestFromNetwork>,
+        partial_witness_adapter: PartialWitnessSenderForNetwork,
         whitelist_nodes: Vec<WhitelistNode>,
     ) -> Self {
         Self {
             runtime: Runtime::new(),
-            graph: Arc::new(crate::routing::Graph::new(
-                crate::routing::GraphConfig {
-                    node_id: config.node_id(),
-                    prune_unreachable_peers_after: PRUNE_UNREACHABLE_PEERS_AFTER,
-                    prune_edges_after: Some(PRUNE_EDGES_AFTER),
-                },
-                store.clone(),
-            )),
+            graph: Arc::new(crate::routing::Graph::new(crate::routing::GraphConfig {
+                node_id: config.node_id(),
+                prune_unreachable_peers_after: PRUNE_UNREACHABLE_PEERS_AFTER,
+                prune_edges_after: Some(PRUNE_EDGES_AFTER),
+            })),
             graph_v2: Arc::new(crate::routing::GraphV2::new(crate::routing::GraphConfigV2 {
                 node_id: config.node_id(),
                 prune_edges_after: Some(PRUNE_EDGES_AFTER),
@@ -186,6 +183,7 @@ impl NetworkState {
             genesis_id,
             client,
             shards_manager_adapter,
+            partial_witness_adapter,
             chain_info: Default::default(),
             tier2: connection::Pool::new(config.node_id()),
             tier1: connection::Pool::new(config.node_id()),
@@ -199,7 +197,7 @@ impl NetworkState {
             tier2_route_back: Mutex::new(RouteBackCache::default()),
             tier1_route_back: Mutex::new(RouteBackCache::default()),
             recent_routed_messages: Mutex::new(lru::LruCache::new(
-                RECENT_ROUTED_MESSAGES_CACHE_SIZE,
+                NonZeroUsize::new(RECENT_ROUTED_MESSAGES_CACHE_SIZE).unwrap(),
             )),
             txns_since_last_block: AtomicUsize::new(0),
             whitelist_nodes,
@@ -429,9 +427,10 @@ impl NetworkState {
             interval.tick(&clock).await;
 
             let result = async {
-                let stream = tcp::Stream::connect(&peer_info, tcp::Tier::T2)
-                    .await
-                    .context("tcp::Stream::connect()")?;
+                let stream =
+                    tcp::Stream::connect(&peer_info, tcp::Tier::T2, &self.config.socket_options)
+                        .await
+                        .context("tcp::Stream::connect()")?;
                 PeerActor::spawn_and_handshake(clock.clone(), stream, None, self.clone())
                     .await
                     .context("PeerActor::spawn()")?;
@@ -445,9 +444,9 @@ impl NetworkState {
                 tracing::info!(target:"network", err = format!("{:#}", err), "Failed to connect to {peer_info}");
             }
 
-            if self.peer_store.peer_connection_attempt(&clock, &peer_info.id, result).is_err() {
-                tracing::error!(target: "network", ?peer_info, "Failed to store connection attempt.");
-            }
+            // The peer may not be in the peer store; we try to record the connection attempt but
+            // ignore any storage errors
+            let _ = self.peer_store.peer_connection_attempt(&clock, &peer_info.id, result);
 
             if succeeded {
                 return;
@@ -557,18 +556,14 @@ impl NetworkState {
 
     /// Send message to specific account.
     /// Return whether the message is sent or not.
-    /// The message might be sent over TIER1 and/or TIER2 connection depending on the message type.
+    /// The message might be sent over TIER1 or TIER2 connection depending on the message type.
     pub fn send_message_to_account(
         &self,
         clock: &time::Clock,
         account_id: &AccountId,
         msg: RoutedMessageBody,
     ) -> bool {
-        let mut success = false;
         let accounts_data = self.accounts_data.load();
-        // All TIER1 messages are being sent over both TIER1 and TIER2 connections for now,
-        // so that we can actually observe the latency/reliability improvements in practice:
-        // for each message we track over which network tier it arrived faster?
         if tcp::Tier::T1.is_allowed_routed(&msg) {
             for key in accounts_data.keys_by_id.get(account_id).iter().flat_map(|keys| keys.iter())
             {
@@ -586,11 +581,10 @@ impl NetworkState {
                     clock,
                     RawRoutedMessage {
                         target: PeerIdOrHash::PeerId(data.peer_id.clone()),
-                        body: msg.clone(),
+                        body: msg,
                     },
                 ))));
-                success |= true;
-                break;
+                return true;
             }
         }
 
@@ -624,14 +618,11 @@ impl NetworkState {
             return false;
         };
 
+        let mut success = false;
         let msg = RawRoutedMessage { target: PeerIdOrHash::PeerId(target), body: msg };
         let msg = self.sign_message(clock, msg);
-        if msg.body.is_important() {
-            for _ in 0..IMPORTANT_MESSAGE_RESENT_COUNT {
-                success |= self.send_message_to_peer(clock, tcp::Tier::T2, msg.clone());
-            }
-        } else {
-            success |= self.send_message_to_peer(clock, tcp::Tier::T2, msg)
+        for _ in 0..msg.body.message_resend_count() {
+            success |= self.send_message_to_peer(clock, tcp::Tier::T2, msg.clone());
         }
         success
     }

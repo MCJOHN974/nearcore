@@ -10,7 +10,7 @@ pub use crate::network_protocol::{
     StateResponseInfoV1, StateResponseInfoV2,
 };
 use crate::routing::routing_table_view::RoutingTableInfo;
-pub use crate::state_sync::{StateSync, StateSyncResponse};
+pub use crate::state_sync::StateSyncResponse;
 use near_async::messaging::{AsyncSender, Sender};
 use near_async::time;
 use near_crypto::PublicKey;
@@ -20,7 +20,7 @@ use near_primitives::hash::CryptoHash;
 use near_primitives::network::{AnnounceAccount, PeerId};
 use near_primitives::sharding::PartialEncodedChunkWithArcReceipts;
 use near_primitives::stateless_validation::{
-    ChunkEndorsement, ChunkStateWitness, ChunkStateWitnessAck,
+    ChunkEndorsement, ChunkStateWitnessAck, PartialEncodedStateWitness,
 };
 use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::{AccountId, BlockHeight, EpochHeight, ShardId};
@@ -258,12 +258,14 @@ pub enum NetworkRequests {
     TxStatus(AccountId, AccountId, CryptoHash),
     /// A challenge to invalidate a block.
     Challenge(Challenge),
-    /// A chunk's state witness.
-    ChunkStateWitness(Vec<AccountId>, ChunkStateWitness),
     /// Acknowledgement to a chunk's state witness, sent back to the originating chunk producer.
     ChunkStateWitnessAck(AccountId, ChunkStateWitnessAck),
     /// Message for a chunk endorsement, sent by a chunk validator to the block producer.
     ChunkEndorsement(AccountId, ChunkEndorsement),
+    /// Message from chunk producer to set of chunk validators to send state witness part.
+    PartialEncodedStateWitness(Vec<(AccountId, PartialEncodedStateWitness)>),
+    /// Message from chunk validator to all other chunk validators to forward state witness part.
+    PartialEncodedStateWitnessForward(Vec<AccountId>, PartialEncodedStateWitness),
 }
 
 /// Combines peer address info, chain.

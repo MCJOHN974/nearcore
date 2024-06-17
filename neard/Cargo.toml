@@ -74,9 +74,7 @@ rosetta_rpc = ["nearcore/rosetta_rpc"]
 json_rpc = ["nearcore/json_rpc"]
 protocol_feature_fix_staking_threshold = ["nearcore/protocol_feature_fix_staking_threshold"]
 protocol_feature_nonrefundable_transfer_nep491 = ["near-state-viewer/protocol_feature_nonrefundable_transfer_nep491"]
-serialize_all_state_changes = ["nearcore/serialize_all_state_changes"]
-new_epoch_sync = ["nearcore/new_epoch_sync", "dep:near-epoch-sync-tool"]
-yield_resume = ["nearcore/yield_resume"]
+new_epoch_sync = ["nearcore/new_epoch_sync", "near-epoch-sync-tool/new_epoch_sync"]
 
 nightly = [
   "near-chain-configs/nightly",
@@ -98,8 +96,6 @@ nightly = [
   "nightly_protocol",
   "protocol_feature_fix_staking_threshold",
   "protocol_feature_nonrefundable_transfer_nep491",
-  "serialize_all_state_changes",
-  "yield_resume",
 ]
 nightly_protocol = [
   "near-chain-configs/nightly_protocol",
@@ -136,7 +132,7 @@ calimero_zero_storage = [
 # with this flag and then enable it at runtime with `--record-io-trace=path` option.
 io_trace = ["near-store/io_trace", "near-o11y/io_trace", "nearcore/io_trace"]
 
-sandbox = ["nearcore/sandbox"]
+sandbox = ["near-o11y/sandbox", "nearcore/sandbox"]
 
 [package.metadata.workspaces]
 independent = true

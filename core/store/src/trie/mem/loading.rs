@@ -4,30 +4,57 @@ use crate::flat::store_helper::{
     decode_flat_state_db_key, get_all_deltas_metadata, get_delta_changes, get_flat_storage_status,
 };
 use crate::flat::{FlatStorageError, FlatStorageStatus};
+use crate::trie::mem::arena::Arena;
 use crate::trie::mem::construction::TrieConstructor;
+use crate::trie::mem::parallel_loader::load_memtrie_in_parallel;
 use crate::trie::mem::updating::apply_memtrie_changes;
-use crate::{DBCol, Store};
+use crate::{DBCol, NibbleSlice, Store};
 use near_primitives::errors::StorageError;
 use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::{get_block_shard_uid, ShardUId};
 use near_primitives::state::FlatStateValue;
 use near_primitives::types::chunk_extra::ChunkExtra;
-use near_primitives::types::BlockHeight;
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use near_primitives::types::{BlockHeight, StateRoot};
 use std::collections::BTreeSet;
 use std::time::Instant;
 use tracing::{debug, info};
 
 /// Loads a trie from the FlatState column. The returned `MemTries` contains
 /// exactly one trie root.
+///
+/// `parallelize` can be used to speed up reading from db. However, it should
+/// only be used when no other work is being done, such as during initial
+/// startup. It also incurs a higher peak memory usage.
 pub fn load_trie_from_flat_state(
     store: &Store,
     shard_uid: ShardUId,
     state_root: CryptoHash,
     block_height: BlockHeight,
+    parallelize: bool,
 ) -> Result<MemTries, StorageError> {
-    let mut tries = MemTries::new(shard_uid);
+    if parallelize && state_root != CryptoHash::default() {
+        const NUM_PARALLEL_SUBTREES_DESIRED: usize = 256;
+        let load_start = Instant::now();
+        let (arena, root_id) = load_memtrie_in_parallel(
+            store.clone(),
+            shard_uid,
+            state_root,
+            NUM_PARALLEL_SUBTREES_DESIRED,
+            shard_uid.to_string(),
+        )?;
 
+        info!(target: "memtrie", shard_uid=%shard_uid, "Done loading trie from flat state, took {:?}", load_start.elapsed());
+        let root = root_id.as_ptr(arena.memory());
+        assert_eq!(
+            root.view().node_hash(),
+            state_root,
+            "In-memory trie for shard {} has incorrect state root",
+            shard_uid
+        );
+        return Ok(MemTries::new_from_arena_and_root(shard_uid, block_height, arena, root_id));
+    }
+
+    let mut tries = MemTries::new(shard_uid);
     tries.construct_root(block_height, |arena| -> Result<Option<MemTrieNodeId>, StorageError> {
         info!(target: "memtrie", shard_uid=%shard_uid, "Loading trie from flat state...");
         let load_start = Instant::now();
@@ -43,7 +70,7 @@ pub fn load_trie_from_flat_state(
                 FlatStorageError::StorageInternalError(format!(
                     "invalid FlatState key format: {err}"
                 ))})?;
-            recon.add_leaf(&key, value);
+            recon.add_leaf(NibbleSlice::new(&key), value);
             num_keys_loaded += 1;
             if num_keys_loaded % 1000000 == 0 {
                 debug!(
@@ -66,15 +93,9 @@ pub fn load_trie_from_flat_state(
         debug!(
             target: "memtrie",
             %shard_uid,
-            "Loaded {} keys; computing hash and memory usage...",
+            "Loaded {} keys in total",
             num_keys_loaded
         );
-        let mut subtrees = Vec::new();
-        root_id.as_ptr_mut(arena.memory_mut()).take_small_subtrees(1024 * 1024, &mut subtrees);
-        subtrees.into_par_iter().for_each(|mut subtree| {
-            subtree.compute_hash_recursively();
-        });
-        root_id.as_ptr_mut(arena.memory_mut()).compute_hash_recursively();
         info!(target: "memtrie", shard_uid=%shard_uid, "Done loading trie from flat state, took {:?}", load_start.elapsed());
 
         let root = root_id.as_ptr(arena.memory());
@@ -113,9 +134,12 @@ fn get_state_root(
 /// deltas. The returned tries would contain a root for each block that the
 /// flat storage currently has, i.e. one for the final block, and one for each
 /// block that flat storage has a delta for, possibly in more than one fork.
+/// `state_root` parameter is required if `ChunkExtra` is not available, e.g. on catchup.
 pub fn load_trie_from_flat_state_and_delta(
     store: &Store,
     shard_uid: ShardUId,
+    state_root: Option<StateRoot>,
+    parallelize: bool,
 ) -> Result<MemTries, StorageError> {
     debug!(target: "memtrie", %shard_uid, "Loading base trie from flat state...");
     let flat_head = match get_flat_storage_status(&store, shard_uid)? {
@@ -128,13 +152,14 @@ pub fn load_trie_from_flat_state_and_delta(
         }
     };
 
-    let mut mem_tries = load_trie_from_flat_state(
-        &store,
-        shard_uid,
-        get_state_root(store, flat_head.hash, shard_uid)?,
-        flat_head.height,
-    )
-    .unwrap();
+    let state_root = match state_root {
+        Some(state_root) => state_root,
+        None => get_state_root(store, flat_head.hash, shard_uid)?,
+    };
+
+    let mut mem_tries =
+        load_trie_from_flat_state(&store, shard_uid, state_root, flat_head.height, parallelize)
+            .unwrap();
 
     debug!(target: "memtrie", %shard_uid, "Loading flat state deltas...");
     // We load the deltas in order of height, so that we always have the previous state root
@@ -185,17 +210,19 @@ mod tests {
     use crate::trie::mem::loading::load_trie_from_flat_state;
     use crate::trie::mem::lookup::memtrie_lookup;
     use crate::{DBCol, KeyLookupMode, NibbleSlice, ShardTries, Store, Trie, TrieUpdate};
+    use near_primitives::congestion_info::CongestionInfo;
     use near_primitives::hash::CryptoHash;
     use near_primitives::shard_layout::{get_block_shard_uid, ShardUId};
     use near_primitives::state::FlatStateValue;
     use near_primitives::trie_key::TrieKey;
     use near_primitives::types::chunk_extra::ChunkExtra;
     use near_primitives::types::StateChangeCause;
+    use near_primitives::version::{ProtocolFeature, PROTOCOL_VERSION};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
-    fn check(keys: Vec<Vec<u8>>) {
-        let shard_tries = TestTriesBuilder::new().with_flat_storage().build();
+    fn check_maybe_parallelize(keys: Vec<Vec<u8>>, parallelize: bool) {
+        let shard_tries = TestTriesBuilder::new().with_flat_storage(true).build();
         let shard_uid = ShardUId::single_shard();
         let changes = keys.iter().map(|key| (key.to_vec(), Some(key.to_vec()))).collect::<Vec<_>>();
         let changes = simplify_changes(&changes);
@@ -209,9 +236,14 @@ mod tests {
         let state_root = test_populate_trie(&shard_tries, &Trie::EMPTY_ROOT, shard_uid, changes);
 
         eprintln!("Trie and flat storage populated");
-        let in_memory_trie =
-            load_trie_from_flat_state(&shard_tries.get_store(), shard_uid, state_root, 123)
-                .unwrap();
+        let in_memory_trie = load_trie_from_flat_state(
+            &shard_tries.get_store(),
+            shard_uid,
+            state_root,
+            123,
+            parallelize,
+        )
+        .unwrap();
         eprintln!("In memory trie loaded");
 
         if keys.is_empty() {
@@ -242,7 +274,7 @@ mod tests {
             // Do another access with the trie to see how many nodes we're supposed to
             // have accessed.
             let temp_trie = shard_tries.get_trie_for_shard(shard_uid, state_root);
-            temp_trie.get_optimized_ref(key, crate::KeyLookupMode::Trie).unwrap();
+            temp_trie.get_optimized_ref(key, KeyLookupMode::Trie).unwrap();
             assert_eq!(
                 temp_trie.get_trie_nodes_count().db_reads,
                 nodes_accessed.len() as u64,
@@ -274,6 +306,11 @@ mod tests {
             }
             check(keys);
         }
+    }
+
+    fn check(keys: Vec<Vec<u8>>) {
+        check_maybe_parallelize(keys.clone(), false);
+        check_maybe_parallelize(keys, true);
     }
 
     fn nibbles(hex: &str) -> Vec<u8> {
@@ -461,7 +498,7 @@ mod tests {
         // Load into memory. It should load the base flat state (block 0), plus all
         // four deltas. We'll check against the state roots at each block; they should
         // all exist in the loaded memtrie.
-        let mem_tries = load_trie_from_flat_state_and_delta(&store, shard_uid).unwrap();
+        let mem_tries = load_trie_from_flat_state_and_delta(&store, shard_uid, None, true).unwrap();
 
         assert_eq!(
             memtrie_lookup(mem_tries.get_root(&state_root_0).unwrap(), &test_key.to_vec(), None)
@@ -532,7 +569,20 @@ mod tests {
         shard_uid: ShardUId,
         state_root: CryptoHash,
     ) {
-        let chunk_extra = ChunkExtra::new(&state_root, CryptoHash::default(), Vec::new(), 0, 0, 0);
+        let congestion_info = ProtocolFeature::CongestionControl
+            .enabled(PROTOCOL_VERSION)
+            .then(CongestionInfo::default);
+
+        let chunk_extra = ChunkExtra::new(
+            PROTOCOL_VERSION,
+            &state_root,
+            CryptoHash::default(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            congestion_info,
+        );
         let mut store_update = store.store_update();
         store_update
             .set_ser(DBCol::ChunkExtra, &get_block_shard_uid(&block_hash, &shard_uid), &chunk_extra)

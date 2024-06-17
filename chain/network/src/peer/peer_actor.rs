@@ -1,9 +1,8 @@
 use crate::accounts_data::AccountDataError;
 use crate::client::{
     AnnounceAccountRequest, BlockApproval, BlockHeadersRequest, BlockHeadersResponse, BlockRequest,
-    BlockResponse, ChunkEndorsementMessage, ChunkStateWitnessAckMessage, ChunkStateWitnessMessage,
-    ProcessTxRequest, RecvChallenge, StateRequestHeader, StateRequestPart, StateResponse,
-    TxStatusRequest, TxStatusResponse,
+    BlockResponse, ChunkEndorsementMessage, ProcessTxRequest, RecvChallenge, StateRequestHeader,
+    StateRequestPart, StateResponse, TxStatusRequest, TxStatusResponse,
 };
 use crate::concurrency::atomic_cell::AtomicCell;
 use crate::concurrency::demux;
@@ -27,6 +26,10 @@ use crate::routing::edge::verify_nonce;
 use crate::routing::NetworkTopologyChange;
 use crate::shards_manager::ShardsManagerRequestFromNetwork;
 use crate::snapshot_hosts::SnapshotHostInfoError;
+use crate::state_witness::{
+    ChunkStateWitnessAckMessage, PartialEncodedStateWitnessForwardMessage,
+    PartialEncodedStateWitnessMessage,
+};
 use crate::stats::metrics;
 use crate::tcp;
 use crate::types::{
@@ -35,7 +38,7 @@ use crate::types::{
 use actix::fut::future::wrap_future;
 use actix::{Actor as _, ActorContext as _, ActorFutureExt as _, AsyncContext as _};
 use lru::LruCache;
-use near_async::messaging::SendAsync;
+use near_async::messaging::{CanSend, SendAsync};
 use near_async::time;
 use near_crypto::Signature;
 use near_o11y::{handler_debug_span, log_assert, WithSpanContext};
@@ -54,6 +57,7 @@ use std::cmp::min;
 use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -330,7 +334,9 @@ impl PeerActor {
                     framed,
                     tracker: Default::default(),
                     stats,
-                    routed_message_cache: LruCache::new(ROUTED_MESSAGE_CACHE_SIZE),
+                    routed_message_cache: LruCache::new(
+                        NonZeroUsize::new(ROUTED_MESSAGE_CACHE_SIZE).unwrap(),
+                    ),
                     protocol_buffers_supported: false,
                     force_encoding,
                     peer_info: match &stream_type {
@@ -417,6 +423,9 @@ impl PeerActor {
                 .inc(),
             PeerMessage::SyncSnapshotHosts(_) => {
                 metrics::SYNC_SNAPSHOT_HOSTS.with_label_values(&["sent"]).inc()
+            }
+            PeerMessage::Routed(routed) => {
+                tracing::debug!(target: "network", source=?routed.msg.author, target=?routed.msg.target, message=?routed.msg.body, "send_routed_message");
             }
             _ => (),
         };
@@ -1012,16 +1021,24 @@ impl PeerActor {
                     .send(ShardsManagerRequestFromNetwork::ProcessPartialEncodedChunkForward(msg));
                 None
             }
-            RoutedMessageBody::ChunkStateWitness(witness) => {
-                network_state.client.send_async(ChunkStateWitnessMessage(witness)).await.ok();
-                None
-            }
             RoutedMessageBody::ChunkStateWitnessAck(ack) => {
-                network_state.client.send_async(ChunkStateWitnessAckMessage(ack)).await.ok();
+                network_state.partial_witness_adapter.send(ChunkStateWitnessAckMessage(ack));
                 None
             }
             RoutedMessageBody::ChunkEndorsement(endorsement) => {
                 network_state.client.send_async(ChunkEndorsementMessage(endorsement)).await.ok();
+                None
+            }
+            RoutedMessageBody::PartialEncodedStateWitness(witness) => {
+                network_state
+                    .partial_witness_adapter
+                    .send(PartialEncodedStateWitnessMessage(witness));
+                None
+            }
+            RoutedMessageBody::PartialEncodedStateWitnessForward(witness) => {
+                network_state
+                    .partial_witness_adapter
+                    .send(PartialEncodedStateWitnessForwardMessage(witness));
                 None
             }
             body => {

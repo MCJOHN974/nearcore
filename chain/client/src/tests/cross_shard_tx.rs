@@ -17,7 +17,7 @@ use near_o11y::testonly::init_integration_logger;
 use near_o11y::WithSpanContextExt;
 use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::SignedTransaction;
-use near_primitives::types::{AccountId, BlockReference};
+use near_primitives::types::{AccountId, BlockId, BlockReference};
 use near_primitives::views::QueryResponseKind::ViewAccount;
 use near_primitives::views::{QueryRequest, QueryResponse};
 use std::collections::HashSet;
@@ -44,7 +44,7 @@ fn test_keyvalue_runtime_balances() {
         let validators = vs.all_block_producers().cloned().collect::<Vec<_>>();
         let key_pairs =
             vec![PeerInfo::random(), PeerInfo::random(), PeerInfo::random(), PeerInfo::random()];
-        let (_, conn, _) = setup_mock_all_validators(
+        let (conn, _) = setup_mock_all_validators(
             Clock::real(),
             vs,
             key_pairs,
@@ -115,7 +115,7 @@ fn send_tx(
                         nonce,
                         from.clone(),
                         to.clone(),
-                        &signer,
+                        &signer.into(),
                         amount,
                         block_hash,
                     ),
@@ -441,14 +441,7 @@ fn test_cross_shard_tx_common(
         let observed_balances = Arc::new(RwLock::new(vec![]));
         let presumable_epoch = Arc::new(RwLock::new(0usize));
 
-        let mut balances_local = balances.write().unwrap();
-        let mut observed_balances_local = observed_balances.write().unwrap();
-        for i in 0..8 {
-            balances_local.push(1000 + 100 * i);
-            observed_balances_local.push(0);
-        }
-
-        let (genesis_block, conn, block_stats) = setup_mock_all_validators(
+        let (conn, block_stats) = setup_mock_all_validators(
             Clock::real(),
             vs,
             key_pairs,
@@ -466,8 +459,28 @@ fn test_cross_shard_tx_common(
                 (PeerManagerMessageResponse::NetworkResponses(NetworkResponses::NoResponse), true)
             }),
         );
+        let genesis_block = {
+            conn[0]
+                .view_client_actor
+                .send(
+                    near_client_primitives::types::GetBlock(BlockReference::BlockId(
+                        BlockId::Height(0),
+                    ))
+                    .with_span_context(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        };
         *connectors.write().unwrap() = conn;
-        let block_hash = *genesis_block.hash();
+        let block_hash = genesis_block.header.hash;
+
+        let mut balances_local = balances.write().unwrap();
+        let mut observed_balances_local = observed_balances.write().unwrap();
+        for i in 0..8 {
+            balances_local.push(1000 + 100 * i);
+            observed_balances_local.push(0);
+        }
 
         let connectors_ = connectors.write().unwrap();
         let iteration = Arc::new(AtomicUsize::new(0));

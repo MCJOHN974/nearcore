@@ -122,7 +122,7 @@ fn test_reads_with_incomplete_storage() {
         {
             println!("Testing TrieIterator over whole trie");
             let trie_records = |trie: Trie| -> Result<_, StorageError> {
-                let iterator = trie.iter()?;
+                let iterator = trie.disk_iter()?;
                 iterator.collect::<Result<Vec<_>, _>>().map(move |v| (trie, v))
             };
             test_incomplete_storage(get_trie(), trie_records);
@@ -208,12 +208,10 @@ mod trie_storage_tests {
     use crate::trie::accounting_cache::TrieAccountingCache;
     use crate::trie::trie_storage::{TrieCache, TrieCachingStorage, TrieDBStorage};
     use crate::trie::TrieRefcountAddition;
-    use crate::{DBCol, Store, TrieChanges, TrieConfig};
+    use crate::{Store, TrieChanges, TrieConfig, TrieIterator};
     use assert_matches::assert_matches;
     use near_o11y::testonly::init_test_logger;
     use near_primitives::hash::hash;
-    use near_primitives::shard_layout::get_block_shard_uid;
-    use near_primitives::types::chunk_extra::ChunkExtra;
 
     fn create_store_with_values(values: &[Vec<u8>], shard_uid: ShardUId) -> Store {
         let tries = TestTriesBuilder::new().build();
@@ -419,84 +417,123 @@ mod trie_storage_tests {
         assert_eq!(count_delta.mem_reads, 1);
     }
 
-    // Checks that when branch restructuring is triggered on updating trie,
-    // impacted child is still recorded.
-    //
-    // Needed when branch has two children, one of which is removed, branch
-    // could be converted to extension, so reading of the only remaining child
-    // is also required.
-    #[test]
-    fn test_memtrie_recorded_branch_restructuring() {
+    fn test_memtrie_and_disk_updates_consistency(updates: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
         init_test_logger();
+        let base_changes = vec![
+            (vec![7], Some(vec![1])),
+            (vec![7, 0], Some(vec![2])),
+            (vec![7, 1], Some(vec![3])),
+        ];
         let tries = TestTriesBuilder::new().build();
         let shard_uid = ShardUId::single_shard();
 
-        let state_root = test_populate_trie(
-            &tries,
-            &Trie::EMPTY_ROOT,
-            shard_uid,
-            vec![
-                (vec![7], Some(vec![1])),
-                (vec![7, 0], Some(vec![2])),
-                (vec![7, 1], Some(vec![3])),
-            ],
-        );
+        let state_root =
+            test_populate_trie(&tries, &Trie::EMPTY_ROOT, shard_uid, base_changes.clone());
         let trie = tries.get_trie_for_shard(shard_uid, state_root).recording_reads();
-        let changes = trie
-            .update(vec![
-                (vec![7], Some(vec![10])),
-                (vec![7, 0], None),
-                (vec![7, 6], Some(vec![8])),
-            ])
-            .unwrap();
+        let changes = trie.update(updates.clone()).unwrap();
         tracing::info!("Changes: {:?}", changes);
 
         let recorded_normal = trie.recorded_storage();
 
-        let store = create_test_store();
-        // ChunkExtra is needed for in-memory trie loading code to query state roots.
-        let chunk_extra =
-            ChunkExtra::new(&Trie::EMPTY_ROOT, CryptoHash::default(), Vec::new(), 0, 0, 0);
-        let mut update_for_chunk_extra = store.store_update();
-        update_for_chunk_extra
-            .set_ser(
-                DBCol::ChunkExtra,
-                &get_block_shard_uid(&CryptoHash::default(), &shard_uid),
-                &chunk_extra,
-            )
-            .unwrap();
-        update_for_chunk_extra.commit().unwrap();
-
-        let tries = TestTriesBuilder::new()
-            .with_store(store)
-            .with_flat_storage()
-            .with_in_memory_tries()
-            .build();
+        let tries =
+            TestTriesBuilder::new().with_flat_storage(true).with_in_memory_tries(true).build();
         let shard_uid = ShardUId::single_shard();
 
-        let state_root = test_populate_trie(
-            &tries,
-            &Trie::EMPTY_ROOT,
-            shard_uid,
-            vec![
-                (vec![7], Some(vec![1])),
-                (vec![7, 0], Some(vec![2])),
-                (vec![7, 1], Some(vec![3])),
-            ],
-        );
+        let state_root = test_populate_trie(&tries, &Trie::EMPTY_ROOT, shard_uid, base_changes);
         let trie = tries.get_trie_for_shard(shard_uid, state_root).recording_reads();
-        let changes = trie
-            .update(vec![
-                (vec![7], Some(vec![10])),
-                (vec![7, 0], None),
-                (vec![7, 6], Some(vec![8])),
-            ])
-            .unwrap();
+        let changes = trie.update(updates).unwrap();
 
         tracing::info!("Changes: {:?}", changes);
 
         let recorded_memtrie = trie.recorded_storage();
 
         assert_eq!(recorded_normal, recorded_memtrie);
+    }
+
+    // Checks that when branch restructuring is triggered on updating trie,
+    // impacted child is recorded on memtrie.
+    //
+    // Needed when branch has two children, one of which is removed, branch
+    // could be converted to extension, so reading of the only remaining child
+    // is also required.
+    #[test]
+    fn test_memtrie_recorded_branch_restructuring() {
+        test_memtrie_and_disk_updates_consistency(vec![
+            (vec![7], Some(vec![1])),
+            (vec![7, 0], Some(vec![2])),
+            (vec![7, 1], Some(vec![3])),
+        ]);
+    }
+
+    // Checks that when non-existent key is removed, only nodes along the path
+    // to it is recorded.
+    // Needed because old disk trie logic was always reading neighbouring children
+    // along the path to recompute memory usages, which is not needed if trie
+    // structure doesn't change.
+    #[test]
+    fn test_memtrie_recorded_delete_non_existent_key() {
+        test_memtrie_and_disk_updates_consistency(vec![(vec![8], None)]);
+    }
+
+    #[test]
+    fn test_memtrie_iteration_recording() {
+        init_test_logger();
+
+        let base_changes = vec![
+            (vec![6], Some(vec![0])),
+            (vec![7], Some(vec![1])),
+            (vec![7, 0], Some(vec![2])),
+            (vec![7, 1], Some(vec![3])),
+            (vec![8], Some(vec![4])),
+        ];
+
+        let tries =
+            TestTriesBuilder::new().with_flat_storage(true).with_in_memory_tries(true).build();
+        let shard_uid = ShardUId::single_shard();
+
+        let state_root = test_populate_trie(&tries, &Trie::EMPTY_ROOT, shard_uid, base_changes);
+
+        let iter_prefix = vec![7];
+        let expected_iter_results =
+            vec![(vec![7], vec![1]), (vec![7, 0], vec![2]), (vec![7, 1], vec![3])];
+
+        let disk_iter_recorded = {
+            let trie = tries.get_trie_for_shard(shard_uid, state_root).recording_reads();
+            let mut disk_iter = trie.disk_iter().unwrap();
+            disk_iter.seek_prefix(&iter_prefix).unwrap();
+            let disk_iter_results = disk_iter.collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(disk_iter_results, expected_iter_results);
+            trie.recorded_storage().unwrap()
+        };
+
+        let memtrie_iter_recorded = {
+            let trie = tries.get_trie_for_shard(shard_uid, state_root).recording_reads();
+            let lock = trie.lock_for_iter();
+            let mut memtrie_iter = lock.iter().unwrap();
+            match memtrie_iter {
+                TrieIterator::Disk(_) => {
+                    panic!("Expected Memtrie iterator, got Disk iterator");
+                }
+                TrieIterator::Memtrie(_) => {}
+            }
+            memtrie_iter.seek_prefix(&iter_prefix).unwrap();
+            let memtrie_iter_results = memtrie_iter.collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(memtrie_iter_results, expected_iter_results);
+            trie.recorded_storage().unwrap()
+        };
+
+        assert_eq!(disk_iter_recorded, memtrie_iter_recorded);
+
+        let partial_recorded = {
+            let trie = Trie::from_recorded_storage(memtrie_iter_recorded, state_root, true)
+                .recording_reads();
+            let mut disk_iter = trie.disk_iter().unwrap();
+            disk_iter.seek_prefix(&iter_prefix).unwrap();
+            let disk_iter_results = disk_iter.collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(disk_iter_results, expected_iter_results);
+            trie.recorded_storage().unwrap()
+        };
+
+        assert_eq!(disk_iter_recorded, partial_recorded);
     }
 }

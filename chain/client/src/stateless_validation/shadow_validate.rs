@@ -1,14 +1,10 @@
-use std::time::Instant;
-
+use near_chain::stateless_validation::chunk_validation::validate_prepared_transactions;
 use near_chain::types::{RuntimeStorageConfig, StorageDataSource};
 use near_chain::{Block, BlockHeader};
 use near_chain_primitives::Error;
 use near_primitives::sharding::{ShardChunk, ShardChunkHeader};
 
-use crate::stateless_validation::chunk_validator::{
-    pre_validate_chunk_state_witness, validate_chunk_state_witness, validate_prepared_transactions,
-};
-use crate::{metrics, Client};
+use crate::Client;
 
 impl Client {
     // Temporary feature to make node produce state witness for every chunk in every processed block
@@ -18,7 +14,7 @@ impl Client {
             return Ok(());
         }
         let block_hash = block.hash();
-        tracing::debug!(target: "stateless_validation", ?block_hash, "shadow validation for block chunks");
+        tracing::debug!(target: "client", ?block_hash, "shadow validation for block chunks");
         let prev_block = self.chain.get_block(block.header().prev_hash())?;
         let prev_block_chunks = prev_block.chunks();
         for chunk in
@@ -29,9 +25,10 @@ impl Client {
             if let Err(err) =
                 self.shadow_validate_chunk(prev_block.header(), prev_chunk_header, &chunk)
             {
-                metrics::SHADOW_CHUNK_VALIDATION_FAILED_TOTAL.inc();
+                near_chain::stateless_validation::metrics::SHADOW_CHUNK_VALIDATION_FAILED_TOTAL
+                    .inc();
                 tracing::error!(
-                    target: "stateless_validation",
+                    target: "client",
                     ?err,
                     shard_id = chunk.shard_id(),
                     ?block_hash,
@@ -48,9 +45,8 @@ impl Client {
         prev_chunk_header: &ShardChunkHeader,
         chunk: &ShardChunk,
     ) -> Result<(), Error> {
-        let shard_id = chunk.shard_id();
-        let chunk_hash = chunk.chunk_hash();
         let chunk_header = chunk.cloned_header();
+        let last_chunk = self.chain.get_chunk(&prev_chunk_header.chunk_hash())?;
 
         let transactions_validation_storage_config = RuntimeStorageConfig {
             state_root: chunk_header.prev_state_root(),
@@ -67,68 +63,30 @@ impl Client {
             &chunk_header,
             transactions_validation_storage_config,
             chunk.transactions(),
+            last_chunk.transactions(),
         ) else {
             return Err(Error::Other(
                 "Could not produce storage proof for new transactions".to_owned(),
             ));
         };
 
-        let witness = self.create_state_witness_inner(
+        let witness = self.create_state_witness(
+            // Setting arbitrary chunk producer is OK for shadow validation
+            "alice.near".parse().unwrap(),
             prev_block_header,
             prev_chunk_header,
             chunk,
             validated_transactions.storage_proof,
         )?;
-        let witness_size = borsh::to_vec(&witness)?.len();
-        metrics::CHUNK_STATE_WITNESS_TOTAL_SIZE
-            .with_label_values(&[&shard_id.to_string()])
-            .observe(witness_size as f64);
-        let pre_validation_start = Instant::now();
-        let pre_validation_result = pre_validate_chunk_state_witness(
-            &witness,
-            &self.chain,
+        if self.config.save_latest_witnesses {
+            self.chain.chain_store.save_latest_chunk_state_witness(&witness)?;
+        }
+        self.chain.shadow_validate_state_witness(
+            witness,
             self.epoch_manager.as_ref(),
             self.runtime_adapter.as_ref(),
+            None,
         )?;
-        tracing::debug!(
-            target: "stateless_validation",
-            shard_id,
-            ?chunk_hash,
-            witness_size,
-            pre_validation_elapsed = ?pre_validation_start.elapsed(),
-            "completed shadow chunk pre-validation"
-        );
-        let epoch_manager = self.epoch_manager.clone();
-        let runtime_adapter = self.runtime_adapter.clone();
-        rayon::spawn(move || {
-            let validation_start = Instant::now();
-            match validate_chunk_state_witness(
-                witness,
-                pre_validation_result,
-                epoch_manager.as_ref(),
-                runtime_adapter.as_ref(),
-            ) {
-                Ok(()) => {
-                    tracing::debug!(
-                        target: "stateless_validation",
-                        shard_id,
-                        ?chunk_hash,
-                        validation_elapsed = ?validation_start.elapsed(),
-                        "completed shadow chunk validation"
-                    );
-                }
-                Err(err) => {
-                    metrics::SHADOW_CHUNK_VALIDATION_FAILED_TOTAL.inc();
-                    tracing::error!(
-                        target: "stateless_validation",
-                        ?err,
-                        shard_id,
-                        ?chunk_hash,
-                        "shadow chunk validation failed"
-                    );
-                }
-            }
-        });
         Ok(())
     }
 }

@@ -1,14 +1,16 @@
+use crate::config::SocketOptions;
 use crate::network_protocol::{
     Encoding, Handshake, HandshakeFailureReason, PartialEdgeInfo, PeerChainInfoV2, PeerIdOrHash,
     PeerMessage, Ping, Pong, RawRoutedMessage, RoutedMessageBody, RoutingTableUpdate,
 };
 use crate::tcp;
 use crate::types::{
-    PartialEncodedChunkRequestMsg, PartialEncodedChunkResponseMsg, PeerInfo, StateResponseInfo,
+    Edge, PartialEncodedChunkRequestMsg, PartialEncodedChunkResponseMsg, PeerInfo,
+    StateResponseInfo,
 };
 use bytes::buf::{Buf, BufMut};
 use bytes::BytesMut;
-use near_async::time::{Duration, Instant, Utc};
+use near_async::time::{Clock, Duration, Instant, Utc};
 use near_crypto::{KeyType, SecretKey};
 use near_primitives::block::{Block, BlockHeader, GenesisId};
 use near_primitives::hash::CryptoHash;
@@ -18,6 +20,8 @@ use near_primitives::version::{ProtocolVersion, PROTOCOL_VERSION};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use time::ext::InstantExt as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Represents a connection to a peer, and provides only minimal functionality.
@@ -221,6 +225,7 @@ impl Connection {
     /// Connect to the NEAR node at `peer_id`@`addr`. The inputs are used to build out handshake,
     /// and this function will return a `Peer` when a handshake has been received successfully.
     pub async fn connect(
+        clock: &Clock,
         addr: SocketAddr,
         peer_id: PeerId,
         my_protocol_version: Option<ProtocolVersion>,
@@ -234,22 +239,27 @@ impl Connection {
         let my_peer_id = PeerId::new(secret_key.public_key());
 
         let start = Instant::now();
-        let stream = tcp::Stream::connect(&PeerInfo::new(peer_id.clone(), addr), tcp::Tier::T2)
-            .await
-            .map_err(ConnectError::TcpConnect)?;
+        let stream = tcp::Stream::connect(
+            &PeerInfo::new(peer_id.clone(), addr),
+            tcp::Tier::T2,
+            &SocketOptions::default(),
+        )
+        .await
+        .map_err(ConnectError::TcpConnect)?;
         tracing::info!(
-            target: "network", "Connection to {}@{:?} established. latency: {}",
-            &peer_id, &addr, start.elapsed(),
+            target: "network",
+            %peer_id, ?addr, latency=?start.elapsed(), "Connection established",
         );
         let mut peer = Self {
             stream: PeerStream::new(stream, recv_timeout),
             peer_id,
             secret_key,
             my_peer_id,
-            route_cache: lru::LruCache::new(1_000_000),
+            route_cache: lru::LruCache::new(NonZeroUsize::new(1_000_000).unwrap()),
             borsh_message_expected: false,
         };
         peer.do_handshake(
+            &clock,
             my_protocol_version.unwrap_or(PROTOCOL_VERSION),
             chain_id,
             genesis_hash,
@@ -314,13 +324,14 @@ impl Connection {
             my_peer_id,
             stream,
             peer_id,
-            route_cache: lru::LruCache::new(1_000_000),
+            route_cache: lru::LruCache::new(NonZeroUsize::new(1_000_000).unwrap()),
             borsh_message_expected,
         })
     }
 
     async fn do_handshake(
         &mut self,
+        clock: &Clock,
         protocol_version: ProtocolVersion,
         chain_id: &str,
         genesis_hash: CryptoHash,
@@ -332,7 +343,7 @@ impl Connection {
             &self.my_peer_id,
             &self.peer_id,
             self.stream.stream.local_addr.port(),
-            1,
+            Edge::create_fresh_nonce(&clock),
             protocol_version,
             chain_id,
             genesis_hash,
@@ -350,7 +361,10 @@ impl Connection {
         match message {
             // TODO: maybe check the handshake for sanity
             PeerMessage::Tier2Handshake(_) => {
-                tracing::info!(target: "network", "handshake latency: {}", timestamp - start);
+                tracing::info!(
+                    target: "network",
+                    handshake_latency=%timestamp.signed_duration_since(start)
+                );
             }
             PeerMessage::HandshakeFailure(_peer_info, reason) => {
                 return Err(ConnectError::HandshakeFailure(reason))

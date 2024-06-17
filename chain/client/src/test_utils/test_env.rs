@@ -1,18 +1,18 @@
-use crate::stateless_validation::processing_tracker::{
-    ProcessingDoneTracker, ProcessingDoneWaiter,
-};
-use crate::Client;
+use crate::{Client, DistributeStateWitnessRequest};
 use near_async::messaging::{CanSend, IntoMultiSender};
 use near_async::time::Clock;
 use near_async::time::{Duration, Instant};
+use near_chain::stateless_validation::processing_tracker::{
+    ProcessingDoneTracker, ProcessingDoneWaiter,
+};
 use near_chain::test_utils::ValidatorSchedule;
 use near_chain::types::Tip;
-use near_chain::{ChainGenesis, Provenance};
+use near_chain::{ChainGenesis, ChainStoreAccess, Provenance};
 use near_chain_configs::GenesisConfig;
 use near_chain_primitives::error::QueryError;
 use near_chunks::client::ShardsManagerResponse;
 use near_chunks::test_utils::{MockClientAdapterForShardsManager, SynchronousShardsManagerAdapter};
-use near_crypto::{InMemorySigner, KeyType, Signer};
+use near_crypto::{InMemorySigner, KeyType};
 use near_network::client::ProcessTxResponse;
 use near_network::shards_manager::ShardsManagerRequestFromNetwork;
 use near_network::test_utils::MockPeerManagerAdapter;
@@ -32,16 +32,19 @@ use near_primitives::test_utils::create_test_signer;
 use near_primitives::transaction::{Action, FunctionCallAction, SignedTransaction};
 use near_primitives::types::{AccountId, Balance, BlockHeight, EpochId, NumSeats, ShardId};
 use near_primitives::utils::MaybeValidated;
-use near_primitives::version::ProtocolVersion;
 use near_primitives::views::{
     AccountView, FinalExecutionOutcomeView, QueryRequest, QueryResponse, QueryResponseKind,
     StateItem,
 };
+use near_store::metadata::DbKind;
 use near_store::ShardUId;
+use near_vm_runner::logic::ProtocolVersion;
 use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use time::ext::InstantExt as _;
 
+use super::mock_partial_witness_adapter::MockPartialWitnessAdapter;
 use super::setup::setup_client_with_runtime;
 use super::test_env_builder::TestEnvBuilder;
 use super::TEST_SEED;
@@ -57,6 +60,7 @@ pub struct TestEnv {
     pub validators: Vec<AccountId>,
     pub network_adapters: Vec<Arc<MockPeerManagerAdapter>>,
     pub client_adapters: Vec<Arc<MockClientAdapterForShardsManager>>,
+    pub partial_witness_adapters: Vec<MockPartialWitnessAdapter>,
     pub shards_manager_adapters: Vec<SynchronousShardsManagerAdapter>,
     pub clients: Vec<Client>,
     pub(crate) account_indices: AccountIndices,
@@ -86,8 +90,44 @@ impl TestEnv {
 
     /// Process a given block in the client with index `id`.
     /// Simulate the block processing logic in `Client`, i.e, it would run catchup and then process accepted blocks and possibly produce chunks.
+    /// Runs garbage collection manually
     pub fn process_block(&mut self, id: usize, block: Block, provenance: Provenance) {
         self.clients[id].process_block_test(MaybeValidated::from(block), provenance).unwrap();
+        // runs gc
+        let runtime_adapter = self.clients[id].chain.runtime_adapter.clone();
+        let epoch_manager = self.clients[id].chain.epoch_manager.clone();
+        let gc_config = self.clients[id].config.gc.clone();
+
+        // A RPC node should do regular garbage collection.
+        if !self.clients[id].config.archive {
+            self.clients[id]
+                .chain
+                .mut_chain_store()
+                .clear_data(&gc_config, runtime_adapter, epoch_manager)
+                .unwrap();
+        } else {
+            // An archival node with split storage should perform garbage collection
+            // on the hot storage. In order to determine if split storage is enabled
+            // *and* that the migration to split storage is finished we can check
+            // the store kind. It's only set to hot after the migration is finished.
+            let store = self.clients[0].chain.chain_store().store();
+            let kind = store.get_db_kind().unwrap();
+            if kind == Some(DbKind::Hot) {
+                self.clients[id]
+                    .chain
+                    .mut_chain_store()
+                    .clear_data(&gc_config, runtime_adapter, epoch_manager)
+                    .unwrap();
+            } else {
+                // An archival node with legacy storage or in the midst of migration to split
+                // storage should do the legacy clear_archive_data.
+                self.clients[id]
+                    .chain
+                    .mut_chain_store()
+                    .clear_archive_data(gc_config.gc_blocks_limit, runtime_adapter)
+                    .unwrap();
+            }
+        }
     }
 
     /// Produces block by given client, which may kick off chunk production.
@@ -257,11 +297,7 @@ impl TestEnv {
         while let Some(msg) = self.client_adapters[id].pop() {
             match msg {
                 ShardsManagerResponse::ChunkCompleted { partial_chunk, shard_chunk } => {
-                    self.clients[id].on_chunk_completed(
-                        partial_chunk,
-                        shard_chunk,
-                        Arc::new(|_| {}),
-                    );
+                    self.clients[id].on_chunk_completed(partial_chunk, shard_chunk, None);
                 }
                 ShardsManagerResponse::InvalidChunk(encoded_chunk) => {
                     self.clients[id].on_invalid_chunk(encoded_chunk);
@@ -271,7 +307,6 @@ impl TestEnv {
                     chunk_producer,
                 } => {
                     self.clients[id]
-                        .chunk_inclusion_tracker
                         .mark_chunk_header_ready_for_inclusion(chunk_header, chunk_producer);
                 }
             }
@@ -293,14 +328,10 @@ impl TestEnv {
     }
 
     fn found_differing_post_state_root_due_to_state_transitions(
-        chunk_state_witness: &ChunkStateWitness,
+        witness: &ChunkStateWitness,
     ) -> bool {
-        let chunk_state_witness_inner = &chunk_state_witness.inner;
-        let mut post_state_roots =
-            HashSet::from([chunk_state_witness_inner.main_state_transition.post_state_root]);
-        post_state_roots.extend(
-            chunk_state_witness_inner.implicit_transitions.iter().map(|t| t.post_state_root),
-        );
+        let mut post_state_roots = HashSet::from([witness.main_state_transition.post_state_root]);
+        post_state_roots.extend(witness.implicit_transitions.iter().map(|t| t.post_state_root));
         post_state_roots.len() >= 2
     }
 
@@ -315,38 +346,48 @@ impl TestEnv {
         };
         let mut witness_processing_done_waiters: Vec<ProcessingDoneWaiter> = Vec::new();
 
-        let network_adapters = self.network_adapters.clone();
-        for network_adapter in network_adapters {
-            network_adapter.handle_filtered(|request| match request {
-                PeerManagerMessageRequest::NetworkRequests(NetworkRequests::ChunkStateWitness(
-                    account_ids,
-                    state_witness,
-                )) => {
-                    // Process chunk state witness for each client.
-                    for account_id in account_ids.iter() {
-                        let processing_done_tracker = ProcessingDoneTracker::new();
-                        witness_processing_done_waiters.push(processing_done_tracker.make_waiter());
+        // Here we are completely bypassing the partial_witness_actor and directly distributing the state witness to the
+        // clients. Ideally the route should have been the following:
+        // [client] ----(DistributeStateWitnessRequest)----> [partial_witness_actor]
+        // [partial_witness_actor] ----(PartialEncodedStateWitness + Forward)----> [partial_witness_actor]
+        // [partial_witness_actor] ----(ChunkStateWitnessMessage)----> [client]
+        // But we go directly from processing DistributeStateWitnessRequest to sending it to all the chunk validators.
+        // Validation of state witness is done in the partial_witness_actor which should be tested by test_loop.
+        let partial_witness_adapters = self.partial_witness_adapters.clone();
+        for (client_idx, partial_witness_adapter) in partial_witness_adapters.iter().enumerate() {
+            while let Some(request) = partial_witness_adapter.pop_distribution_request() {
+                let DistributeStateWitnessRequest { epoch_id, chunk_header, state_witness } =
+                    request;
 
-                        let processing_result =
-                            self.client(account_id).process_chunk_state_witness(
-                                state_witness.clone(),
-                                Some(processing_done_tracker),
-                            );
-                        if !allow_errors {
-                            processing_result.unwrap();
-                        }
+                let raw_witness_size = borsh::to_vec(&state_witness).unwrap().len();
+                let chunk_validators = self.clients[client_idx]
+                    .epoch_manager
+                    .get_chunk_validator_assignments(
+                        &epoch_id,
+                        chunk_header.shard_id(),
+                        chunk_header.height_created(),
+                    )
+                    .unwrap()
+                    .ordered_chunk_validators();
+
+                for account_id in chunk_validators {
+                    let processing_done_tracker = ProcessingDoneTracker::new();
+                    witness_processing_done_waiters.push(processing_done_tracker.make_waiter());
+
+                    let processing_result = self.client(&account_id).process_chunk_state_witness(
+                        state_witness.clone(),
+                        raw_witness_size,
+                        Some(processing_done_tracker),
+                    );
+                    if !allow_errors {
+                        processing_result.unwrap();
                     }
-
-                    // Update output.
-                    output.found_differing_post_state_root_due_to_state_transitions |=
-                        Self::found_differing_post_state_root_due_to_state_transitions(
-                            &state_witness,
-                        );
-
-                    None
                 }
-                _ => Some(request),
-            });
+
+                // Update output.
+                output.found_differing_post_state_root_due_to_state_transitions |=
+                    Self::found_differing_post_state_root_due_to_state_transitions(&state_witness);
+            }
         }
 
         // Wait for all state witnesses to be processed before returning.
@@ -412,7 +453,7 @@ impl TestEnv {
                 return Ok(endorsement);
             }
 
-            let elapsed_since_start = start_time.elapsed();
+            let elapsed_since_start = Instant::now().signed_duration_since(start_time);
             if elapsed_since_start > CHUNK_ENDORSEMENTS_TIMEOUT {
                 return Err(TimeoutError(elapsed_since_start));
             }
@@ -428,17 +469,19 @@ impl TestEnv {
         let tx = SignedTransaction::send_money(
             1,
             account_id.clone(),
-            account_id.clone(),
-            &signer,
+            account_id,
+            &signer.into(),
             100,
             self.clients[id].chain.head().unwrap().last_block_hash,
         );
         self.clients[id].process_tx(tx, false, false)
     }
 
-    /// This function will actually bump to the latest protocol version instead of the provided one.
-    /// See https://github.com/near/nearcore/issues/8590 for details.
-    pub fn upgrade_protocol(&mut self, protocol_version: ProtocolVersion) {
+    /// This function used to be able to upgrade to a specific protocol version
+    /// but due to <https://github.com/near/nearcore/issues/8590> that
+    /// functionality does not work currently.  Hence it is renamed to upgrade
+    /// to the latest version.
+    pub fn upgrade_protocol_to_latest_version(&mut self) {
         assert_eq!(self.clients.len(), 1, "at the moment, this support only a single client");
 
         let tip = self.clients[0].chain.head().unwrap();
@@ -450,8 +493,6 @@ impl TestEnv {
             self.clients[0].epoch_manager.get_block_producer(&epoch_id, tip.height).unwrap();
 
         let mut block = self.clients[0].produce_block(tip.height + 1).unwrap().unwrap();
-        eprintln!("Producing block with version {protocol_version}");
-        block.mut_header().set_latest_protocol_version(protocol_version);
         block.mut_header().resign(&create_test_signer(block_producer.as_str()));
 
         let _ = self.clients[0]
@@ -461,6 +502,11 @@ impl TestEnv {
         for i in 0..self.clients[0].chain.epoch_length * 2 {
             self.produce_block(0, tip.height + i + 2);
         }
+    }
+
+    pub fn get_head_protocol_version(&self) -> ProtocolVersion {
+        let tip = self.clients[0].chain.head().unwrap();
+        self.clients[0].epoch_manager.get_epoch_protocol_version(&tip.epoch_id).unwrap()
     }
 
     pub fn query_account(&mut self, account_id: AccountId) -> AccountView {
@@ -562,7 +608,7 @@ impl TestEnv {
     /// memory caches.
     /// Though, it seems that it is not necessary for current use cases.
     pub fn restart(&mut self, idx: usize) {
-        let account_id = self.get_client_id(idx).clone();
+        let account_id = self.get_client_id(idx);
         let rng_seed = match self.seeds.get(&account_id) {
             Some(seed) => *seed,
             None => TEST_SEED,
@@ -572,7 +618,6 @@ impl TestEnv {
         self.clients[idx] = setup_client_with_runtime(
             self.clock.clone(),
             num_validator_seats,
-            Some(self.get_client_id(idx).clone()),
             false,
             self.network_adapters[idx].clone().as_multi_sender(),
             self.shards_manager_adapters[idx].clone(),
@@ -584,13 +629,16 @@ impl TestEnv {
             self.archive,
             self.save_trie_changes,
             None,
+            self.clients[idx].partial_witness_adapter.clone(),
+            self.clients[idx].validator_signer.get().unwrap(),
         )
     }
 
     /// Returns an [`AccountId`] used by a client at given index.  More
     /// specifically, returns validator id of the client’s validator signer.
-    pub fn get_client_id(&self, idx: usize) -> &AccountId {
-        self.clients[idx].validator_signer.as_ref().unwrap().validator_id()
+    pub fn get_client_id(&self, idx: usize) -> AccountId {
+        let validator_signer = self.clients[idx].validator_signer.get();
+        validator_signer.unwrap().validator_id().clone()
     }
 
     /// Returns the index of client with the given [`AccoountId`].
@@ -645,9 +693,10 @@ impl TestEnv {
             tip.height + 1,
             signer.account_id.clone(),
             receiver,
-            signer,
+            &signer.clone().into(),
             actions,
             tip.last_block_hash,
+            0,
         )
     }
 
@@ -683,9 +732,10 @@ impl TestEnv {
             relayer_nonce,
             relayer,
             sender,
-            &relayer_signer,
+            &relayer_signer.into(),
             vec![Action::Delegate(Box::new(signed_delegate_action))],
             tip.last_block_hash,
+            0,
         )
     }
 
@@ -731,6 +781,37 @@ impl TestEnv {
         }))];
         let tx = self.tx_from_actions(actions, &signer, signer.account_id.clone());
         self.execute_tx(tx).unwrap()
+    }
+
+    /// Print a short summary of all the blocks from genesis to head.
+    pub fn print_summary(&self) {
+        let client = &self.clients[0];
+
+        let genesis_height = client.chain.genesis().height();
+        let head_height = client.chain.head().unwrap().height;
+
+        tracing::info!(target: "test", genesis_height, head_height, "printing summary");
+        for height in genesis_height..head_height + 1 {
+            self.print_block_summary(height);
+        }
+    }
+
+    pub fn print_block_summary(&self, height: u64) {
+        let client = &self.clients[0];
+        let block = client.chain.get_block_by_height(height);
+        let Ok(block) = block else {
+            tracing::info!(target: "test", "Block {}: missing", height);
+            return;
+        };
+        let prev_hash = block.header().prev_hash();
+        let epoch_id = client.epoch_manager.get_epoch_id_from_prev_block(prev_hash).unwrap();
+        let protocol_version = client.epoch_manager.get_epoch_protocol_version(&epoch_id).unwrap();
+        let latest_protocol_version = block.header().latest_protocol_version();
+
+        let block_hash = block.hash();
+        let chunk_mask = block.header().chunk_mask();
+
+        tracing::info!(target: "test", height, ?block_hash, ?chunk_mask, protocol_version, latest_protocol_version, "block");
     }
 }
 

@@ -127,7 +127,7 @@ impl From<SnapshotRemoveError> for StoreOpenerError {
 fn get_default_kind(archive: bool, temp: Temperature) -> DbKind {
     match (temp, archive) {
         (Temperature::Hot, false) => DbKind::RPC,
-        (Temperature::Hot, true) => DbKind::Archive,
+        (Temperature::Hot, true) => DbKind::Hot,
         (Temperature::Cold, _) => DbKind::Cold,
     }
 }
@@ -590,6 +590,9 @@ pub fn checkpoint_hot_storage_and_cleanup_columns(
     let _span =
         tracing::info_span!(target: "state_snapshot", "checkpoint_hot_storage_and_cleanup_columns")
             .entered();
+    if let Some(storage) = hot_store.storage.copy_if_test() {
+        return Ok(NodeStorage::new(storage));
+    }
     let checkpoint_path = checkpoint_base_path.join("data");
     std::fs::create_dir_all(&checkpoint_base_path)?;
 

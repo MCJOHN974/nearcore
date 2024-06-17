@@ -53,7 +53,7 @@ impl From<InvalidTxError> for TxExecutionError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     /// An unexpected integer overflow occurred. The likely issue is an invalid state or the transition.
-    UnexpectedIntegerOverflow,
+    UnexpectedIntegerOverflow(String),
     /// An error happened during TX verification and account charging. It's likely the chunk is invalid.
     /// and should be challenged.
     InvalidTxError(InvalidTxError),
@@ -77,7 +77,16 @@ impl std::fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 /// Contexts in which `StorageError::MissingTrieValue` error might occur.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
 pub enum MissingTrieValueContext {
     /// Missing trie value when reading from TrieIterator.
     TrieIterator,
@@ -91,7 +100,16 @@ pub enum MissingTrieValueContext {
 
 /// Errors which may occur during working with trie storages, storing
 /// trie values (trie nodes and state values) by their hashes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
 pub enum StorageError {
     /// Key-value db internal failure
     StorageInternalError,
@@ -139,15 +157,27 @@ pub enum InvalidTxError {
     /// Happens if a wrong AccessKey used or AccessKey has not enough permissions
     InvalidAccessKeyError(InvalidAccessKeyError),
     /// TX signer_id is not a valid [`AccountId`]
-    InvalidSignerId { signer_id: String },
+    InvalidSignerId {
+        signer_id: String,
+    },
     /// TX signer_id is not found in a storage
-    SignerDoesNotExist { signer_id: AccountId },
+    SignerDoesNotExist {
+        signer_id: AccountId,
+    },
     /// Transaction nonce must be `account[access_key].nonce + 1`.
-    InvalidNonce { tx_nonce: Nonce, ak_nonce: Nonce },
+    InvalidNonce {
+        tx_nonce: Nonce,
+        ak_nonce: Nonce,
+    },
     /// Transaction nonce is larger than the upper bound given by the block height
-    NonceTooLarge { tx_nonce: Nonce, upper_bound: Nonce },
+    NonceTooLarge {
+        tx_nonce: Nonce,
+        upper_bound: Nonce,
+    },
     /// TX receiver_id is not a valid AccountId
-    InvalidReceiverId { receiver_id: String },
+    InvalidReceiverId {
+        receiver_id: String,
+    },
     /// TX signature is not valid
     InvalidSignature,
     /// Account does not have enough balance to cover TX cost
@@ -175,7 +205,25 @@ pub enum InvalidTxError {
     /// An error occurred while validating actions of a Transaction.
     ActionsValidation(ActionsValidationError),
     /// The size of serialized transaction exceeded the limit.
-    TransactionSizeExceeded { size: u64, limit: u64 },
+    TransactionSizeExceeded {
+        size: u64,
+        limit: u64,
+    },
+    /// Transaction version is invalid.
+    InvalidTransactionVersion,
+    // Error occurred during storage access
+    StorageError(StorageError),
+    /// The receiver shard of the transaction is too congested to accept new
+    /// transactions at the moment.
+    ShardCongested {
+        shard_id: u32,
+    },
+}
+
+impl From<StorageError> for InvalidTxError {
+    fn from(error: StorageError) -> Self {
+        InvalidTxError::StorageError(error)
+    }
 }
 
 impl std::error::Error for InvalidTxError {}
@@ -288,6 +336,8 @@ pub enum ReceiptValidationError {
     NumberInputDataDependenciesExceeded { number_of_input_data_dependencies: u64, limit: u64 },
     /// An error occurred while validating actions of an ActionReceipt.
     ActionsValidation(ActionsValidationError),
+    /// Receipt is bigger than the limit.
+    ReceiptSizeExceeded { size: u64, limit: u64 },
 }
 
 impl Display for ReceiptValidationError {
@@ -318,6 +368,11 @@ impl Display for ReceiptValidationError {
                 number_of_input_data_dependencies, limit
             ),
             ReceiptValidationError::ActionsValidation(e) => write!(f, "{}", e),
+            ReceiptValidationError::ReceiptSizeExceeded { size, limit } => write!(
+                f,
+                "The size of the receipt exceeded the limit: {} > {}",
+                size, limit
+            ),
         }
     }
 }
@@ -508,8 +563,8 @@ pub enum ActionErrorKind {
     DelegateActionInvalidNonce { delegate_nonce: Nonce, ak_nonce: Nonce },
     /// DelegateAction nonce is larger than the upper bound given by the block height
     DelegateActionNonceTooLarge { delegate_nonce: Nonce, upper_bound: Nonce },
-    /// Sending non-refundable balance to an existing account is not allowed according to NEP-491.
-    NonRefundableBalanceToExistingAccount { account_id: AccountId },
+    /// Non-refundable storage transfer to an existing account is not allowed according to NEP-491.
+    NonRefundableTransferToExistingAccount { account_id: AccountId },
 }
 
 impl From<ActionErrorKind> for ActionError {
@@ -571,6 +626,15 @@ impl Display for InvalidTxError {
             InvalidTxError::TransactionSizeExceeded { size, limit } => {
                 write!(f, "Size of serialized transaction {} exceeded the limit {}", size, limit)
             }
+            InvalidTxError::InvalidTransactionVersion => {
+                write!(f, "Transaction version is invalid")
+            }
+            InvalidTxError::StorageError(error) => {
+                write!(f, "Storage error: {}", error)
+            }
+            InvalidTxError::ShardCongested { shard_id } => {
+                write!(f, "Shard {shard_id} is currently congested and rejects new transactions.")
+            }
         }
     }
 }
@@ -622,17 +686,7 @@ impl Display for InvalidAccessKeyError {
 impl std::error::Error for InvalidAccessKeyError {}
 
 /// Happens when the input balance doesn't match the output balance in Runtime apply.
-#[derive(
-    BorshSerialize,
-    BorshDeserialize,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    RpcError,
-    serde::Deserialize,
-    serde::Serialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, RpcError, serde::Deserialize, serde::Serialize)]
 pub struct BalanceMismatchError {
     // Input balances
     #[serde(with = "dec_format")]
@@ -645,6 +699,10 @@ pub struct BalanceMismatchError {
     pub processed_delayed_receipts_balance: Balance,
     #[serde(with = "dec_format")]
     pub initial_postponed_receipts_balance: Balance,
+    // TODO(congestion_control): remove cfg on stabilization
+    #[cfg(feature = "nightly")]
+    #[serde(with = "dec_format")]
+    pub forwarded_buffered_receipts_balance: Balance,
     // Output balances
     #[serde(with = "dec_format")]
     pub final_accounts_balance: Balance,
@@ -658,6 +716,10 @@ pub struct BalanceMismatchError {
     pub tx_burnt_amount: Balance,
     #[serde(with = "dec_format")]
     pub slashed_burnt_amount: Balance,
+    // TODO(congestion_control): remove cfg on stabilization
+    #[cfg(feature = "nightly")]
+    #[serde(with = "dec_format")]
+    pub new_buffered_receipts_balance: Balance,
     #[serde(with = "dec_format")]
     pub other_burnt_amount: Balance,
 }
@@ -671,6 +733,10 @@ impl Display for BalanceMismatchError {
             .saturating_add(self.incoming_receipts_balance)
             .saturating_add(self.processed_delayed_receipts_balance)
             .saturating_add(self.initial_postponed_receipts_balance);
+        // TODO(congestion_control): remove cfg on stabilization
+        #[cfg(feature = "nightly")]
+        let initial_balance =
+            initial_balance.saturating_add(self.forwarded_buffered_receipts_balance);
         let final_balance = self
             .final_accounts_balance
             .saturating_add(self.outgoing_receipts_balance)
@@ -679,7 +745,13 @@ impl Display for BalanceMismatchError {
             .saturating_add(self.tx_burnt_amount)
             .saturating_add(self.slashed_burnt_amount)
             .saturating_add(self.other_burnt_amount);
-        write!(
+        // TODO(congestion_control): remove cfg on stabilization
+        #[cfg(feature = "nightly")]
+        let final_balance = final_balance.saturating_add(self.new_buffered_receipts_balance);
+
+        // TODO(congestion_control): remove cfg on stabilization
+        #[cfg(not(feature = "nightly"))]
+        return write!(
             f,
             "Balance Mismatch Error. The input balance {} doesn't match output balance {}\n\
              Inputs:\n\
@@ -710,6 +782,43 @@ impl Display for BalanceMismatchError {
             self.tx_burnt_amount,
             self.slashed_burnt_amount,
             self.other_burnt_amount,
+        );
+        #[cfg(feature = "nightly")]
+        write!(
+            f,
+            "Balance Mismatch Error. The input balance {} doesn't match output balance {}\n\
+             Inputs:\n\
+             \tIncoming validator rewards sum: {}\n\
+             \tInitial accounts balance sum: {}\n\
+             \tIncoming receipts balance sum: {}\n\
+             \tProcessed delayed receipts balance sum: {}\n\
+             \tInitial postponed receipts balance sum: {}\n\
+             \tForwarded buffered receipts sum: {}\n\
+             Outputs:\n\
+             \tFinal accounts balance sum: {}\n\
+             \tOutgoing receipts balance sum: {}\n\
+             \tNew delayed receipts balance sum: {}\n\
+             \tFinal postponed receipts balance sum: {}\n\
+             \tTx fees burnt amount: {}\n\
+             \tSlashed amount: {}\n\
+             \tNew buffered receipts balance sum: {}\n\
+             \tOther burnt amount: {}",
+            initial_balance,
+            final_balance,
+            self.incoming_validator_rewards,
+            self.initial_accounts_balance,
+            self.incoming_receipts_balance,
+            self.processed_delayed_receipts_balance,
+            self.initial_postponed_receipts_balance,
+            self.forwarded_buffered_receipts_balance,
+            self.final_accounts_balance,
+            self.outgoing_receipts_balance,
+            self.new_delayed_receipts_balance,
+            self.final_postponed_receipts_balance,
+            self.tx_burnt_amount,
+            self.slashed_burnt_amount,
+            self.new_buffered_receipts_balance,
+            self.other_burnt_amount,
         )
     }
 }
@@ -734,8 +843,8 @@ impl From<IntegerOverflowError> for InvalidTxError {
 }
 
 impl From<IntegerOverflowError> for RuntimeError {
-    fn from(_: IntegerOverflowError) -> Self {
-        RuntimeError::UnexpectedIntegerOverflow
+    fn from(err: IntegerOverflowError) -> Self {
+        RuntimeError::UnexpectedIntegerOverflow(err.to_string())
     }
 }
 
@@ -834,8 +943,8 @@ impl Display for ActionErrorKind {
             ActionErrorKind::DelegateActionAccessKeyError(access_key_error) => Display::fmt(&access_key_error, f),
             ActionErrorKind::DelegateActionInvalidNonce { delegate_nonce, ak_nonce } => write!(f, "DelegateAction nonce {} must be larger than nonce of the used access key {}", delegate_nonce, ak_nonce),
             ActionErrorKind::DelegateActionNonceTooLarge { delegate_nonce, upper_bound } => write!(f, "DelegateAction nonce {} must be smaller than the access key nonce upper bound {}", delegate_nonce, upper_bound),
-            ActionErrorKind::NonRefundableBalanceToExistingAccount { account_id} => {
-                write!(f, "Can't send non-refundable balance to {} because it already exists", account_id)
+            ActionErrorKind::NonRefundableTransferToExistingAccount { account_id} => {
+                write!(f, "Can't make non-refundable storage transfer to {} because it already exists", account_id)
             }
         }
     }

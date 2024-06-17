@@ -360,10 +360,11 @@ pub(crate) static CURRENT_PROTOCOL_VERSION: Lazy<IntGauge> = Lazy::new(|| {
         .unwrap()
 });
 
-pub(crate) static NODE_PROTOCOL_UPGRADE_VOTING_START: Lazy<IntGauge> = Lazy::new(|| {
-    try_create_int_gauge(
+pub(crate) static NODE_PROTOCOL_UPGRADE_VOTING_START: Lazy<IntGaugeVec> = Lazy::new(|| {
+    try_create_int_gauge_vec(
         "near_node_protocol_upgrade_voting_start",
-        "Time in seconds since Unix epoch determining when node will start voting for the protocol upgrade; zero if there is no schedule for the voting")
+        "Time in seconds since Unix epoch determining when node will start voting for the protocol upgrade; zero if there is no schedule for the voting",
+     &["protocol_version"])
         .unwrap()
 });
 
@@ -403,8 +404,12 @@ pub(crate) static PRODUCE_AND_DISTRIBUTE_CHUNK_TIME: Lazy<HistogramVec> = Lazy::
 /// `neard_version` argument.
 pub(crate) fn export_version(neard_version: &near_primitives::version::Version) {
     NODE_PROTOCOL_VERSION.set(near_primitives::version::PROTOCOL_VERSION.into());
-    NODE_PROTOCOL_UPGRADE_VOTING_START
-        .set(near_primitives::version::PROTOCOL_UPGRADE_SCHEDULE.timestamp());
+    let schedule = near_primitives::version::PROTOCOL_UPGRADE_SCHEDULE;
+    for (datetime, protocol_version) in schedule.schedule().iter() {
+        NODE_PROTOCOL_UPGRADE_VOTING_START
+            .with_label_values(&[&protocol_version.to_string()])
+            .set(datetime.timestamp());
+    }
     NODE_DB_VERSION.set(near_store::metadata::DB_VERSION.into());
     NODE_BUILD_INFO.reset();
     NODE_BUILD_INFO
@@ -555,34 +560,6 @@ pub(crate) static SYNC_REQUIREMENT_CURRENT: Lazy<IntGaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub(crate) static SHADOW_CHUNK_VALIDATION_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter(
-        "near_shadow_chunk_validation_failed_total",
-        "Shadow chunk validation failures count",
-    )
-    .unwrap()
-});
-
-pub(crate) static CHUNK_STATE_WITNESS_VALIDATION_TIME: Lazy<HistogramVec> = Lazy::new(|| {
-    try_create_histogram_vec(
-        "near_chunk_state_witness_validation_time",
-        "State witness validation latency in seconds",
-        &["shard_id"],
-        Some(exponential_buckets(0.01, 2.0, 12).unwrap()),
-    )
-    .unwrap()
-});
-
-pub(crate) static CHUNK_STATE_WITNESS_TOTAL_SIZE: Lazy<HistogramVec> = Lazy::new(|| {
-    try_create_histogram_vec(
-        "near_chunk_state_witness_total_size",
-        "Stateless validation state witness size in bytes",
-        &["shard_id"],
-        Some(exponential_buckets(1000.0, 2.0, 20).unwrap()),
-    )
-    .unwrap()
-});
-
 pub(crate) static ORPHAN_CHUNK_STATE_WITNESSES_TOTAL_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     try_create_int_counter_vec(
         "near_orphan_chunk_state_witness_total_count",
@@ -643,6 +620,34 @@ pub(crate) static BLOCK_PRODUCER_MISSING_ENDORSEMENT_COUNT: Lazy<HistogramVec> =
             buckets.append(&mut exponential_buckets(5.0, 1.5, 10).unwrap());
             buckets
         }),
+    )
+    .unwrap()
+});
+
+pub(crate) static PARTIAL_WITNESS_ENCODE_TIME: Lazy<HistogramVec> = Lazy::new(|| {
+    try_create_histogram_vec(
+        "near_partial_witness_encode_time",
+        "Partial state witness generation from encoded state witness time in seconds",
+        &["shard_id"],
+        Some(linear_buckets(0.0, 0.005, 20).unwrap()),
+    )
+    .unwrap()
+});
+
+pub(crate) static PARTIAL_WITNESS_TIME_TO_LAST_PART: Lazy<HistogramVec> = Lazy::new(|| {
+    try_create_histogram_vec(
+        "near_partial_witness_time_to_last_part",
+        "Time taken from receiving first partial witness part to receiving enough parts to decode the state witness",
+        &["shard_id"],
+        Some(exponential_buckets(0.001, 2.0, 13).unwrap()),
+    )
+    .unwrap()
+});
+
+pub(crate) static PARTIAL_WITNESS_CACHE_SIZE: Lazy<Gauge> = Lazy::new(|| {
+    try_create_gauge(
+        "near_partial_witness_cache_size",
+        "Total size in bytes of all currently cached witness parts",
     )
     .unwrap()
 });

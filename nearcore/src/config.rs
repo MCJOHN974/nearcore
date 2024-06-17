@@ -21,14 +21,14 @@ use near_chain_configs::{
     default_view_client_throttle_period, get_initial_supply, ChunkDistributionNetworkConfig,
     ClientConfig, GCConfig, Genesis, GenesisConfig, GenesisValidationMode, LogSummaryStyle,
     MutableConfigValue, ReshardingConfig, StateSyncConfig, BLOCK_PRODUCER_KICKOUT_THRESHOLD,
-    CHUNK_PRODUCER_KICKOUT_THRESHOLD, EXPECTED_EPOCH_LENGTH, FISHERMEN_THRESHOLD,
-    GAS_PRICE_ADJUSTMENT_RATE, GENESIS_CONFIG_FILENAME, INITIAL_GAS_LIMIT, MAX_INFLATION_RATE,
-    MIN_BLOCK_PRODUCTION_DELAY, MIN_GAS_PRICE, NEAR_BASE, NUM_BLOCKS_PER_YEAR,
-    NUM_BLOCK_PRODUCER_SEATS, PROTOCOL_REWARD_RATE, PROTOCOL_UPGRADE_STAKE_THRESHOLD,
-    TRANSACTION_VALIDITY_PERIOD,
+    CHUNK_PRODUCER_KICKOUT_THRESHOLD, CHUNK_VALIDATOR_ONLY_KICKOUT_THRESHOLD,
+    EXPECTED_EPOCH_LENGTH, FISHERMEN_THRESHOLD, GAS_PRICE_ADJUSTMENT_RATE, GENESIS_CONFIG_FILENAME,
+    INITIAL_GAS_LIMIT, MAX_INFLATION_RATE, MIN_BLOCK_PRODUCTION_DELAY, MIN_GAS_PRICE, NEAR_BASE,
+    NUM_BLOCKS_PER_YEAR, NUM_BLOCK_PRODUCER_SEATS, PROTOCOL_REWARD_RATE,
+    PROTOCOL_UPGRADE_STAKE_THRESHOLD, TRANSACTION_VALIDITY_PERIOD,
 };
 use near_config_utils::{ValidationError, ValidationErrors};
-use near_crypto::{InMemorySigner, KeyFile, KeyType, PublicKey, Signer};
+use near_crypto::{InMemorySigner, KeyFile, KeyType, PublicKey};
 use near_epoch_manager::EpochManagerHandle;
 #[cfg(feature = "json_rpc")]
 use near_jsonrpc::RpcConfig;
@@ -105,7 +105,8 @@ pub const CONFIG_FILENAME: &str = "config.json";
 pub const NODE_KEY_FILE: &str = "node_key.json";
 pub const VALIDATOR_KEY_FILE: &str = "validator_key.json";
 
-pub const NETWORK_TELEMETRY_URL: &str = "https://explorer.{}.near.org/api/nodes";
+pub const NETWORK_LEGACY_TELEMETRY_URL: &str = "https://explorer.{}.near.org/api/nodes";
+pub const NETWORK_TELEMETRY_URL: &str = "https://telemetry.nearone.org/nodes";
 
 fn default_doomslug_step_period() -> Duration {
     Duration::milliseconds(100)
@@ -228,7 +229,7 @@ pub struct Config {
     /// If save_trie_changes is not set it will get inferred from the `archive` field as follows:
     /// save_trie_changes = !archive
     /// save_trie_changes should be set to true iff
-    /// - archive if false - non-archival nodes need trie changes to perform garbage collection
+    /// - archive is false - non-archival nodes need trie changes to perform garbage collection
     /// - archive is true and cold_store is configured - node working in split storage mode
     /// needs trie changes in order to do garbage collection on hot and populate cold State column.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,6 +310,12 @@ pub struct Config {
     ///
     /// Each loaded contract will increase the baseline memory use of the node appreciably.
     pub max_loaded_contracts: usize,
+    /// Save observed instances of ChunkStateWitness to the database in DBCol::LatestChunkStateWitnesses.
+    /// Saving the latest witnesses is useful for analysis and debugging.
+    /// When this option is enabled, the node will save ALL witnesses it observes, even invalid ones,
+    /// which can cause extra load on the database. This option is not recommended for production use,
+    /// as a large number of incoming witnesses could cause denial of service.
+    pub save_latest_witnesses: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -357,6 +364,7 @@ impl Default for Config {
             orphan_state_witness_pool_size: default_orphan_state_witness_pool_size(),
             orphan_state_witness_max_size: default_orphan_state_witness_max_size(),
             max_loaded_contracts: 256,
+            save_latest_witnesses: false,
         }
     }
 }
@@ -496,7 +504,7 @@ pub struct NearConfig {
     pub rosetta_rpc_config: Option<RosettaRpcConfig>,
     pub telemetry_config: TelemetryConfig,
     pub genesis: Genesis,
-    pub validator_signer: Option<Arc<dyn ValidatorSigner>>,
+    pub validator_signer: Option<Arc<ValidatorSigner>>,
 }
 
 impl NearConfig {
@@ -504,7 +512,7 @@ impl NearConfig {
         config: Config,
         genesis: Genesis,
         network_key_pair: KeyFile,
-        validator_signer: Option<Arc<dyn ValidatorSigner>>,
+        validator_signer: Option<Arc<ValidatorSigner>>,
     ) -> anyhow::Result<Self> {
         Ok(NearConfig {
             config: config.clone(),
@@ -575,6 +583,7 @@ impl NearConfig {
                 chunk_distribution_network: config.chunk_distribution_network,
                 orphan_state_witness_pool_size: config.orphan_state_witness_pool_size,
                 orphan_state_witness_max_size: config.orphan_state_witness_max_size,
+                save_latest_witnesses: config.save_latest_witnesses,
             },
             network_config: NetworkConfig::new(
                 config.network,
@@ -853,7 +862,8 @@ pub fn init_configs(
             if test_seed.is_some() {
                 bail!("Test seed is not supported for {chain_id}");
             }
-            config.telemetry.endpoints.push(NETWORK_TELEMETRY_URL.replace("{}", &chain_id));
+            config.telemetry.endpoints.push(NETWORK_LEGACY_TELEMETRY_URL.replace("{}", &chain_id));
+            config.telemetry.endpoints.push(NETWORK_TELEMETRY_URL.to_string());
         }
         _ => {
             // Create new configuration, key files and genesis for one validator.
@@ -921,7 +931,7 @@ pub fn init_configs(
                 None => Genesis::from_file(genesis_path_str, GenesisValidationMode::Full),
             }?;
 
-            genesis.config.chain_id = chain_id.clone();
+            genesis.config.chain_id.clone_from(&chain_id);
 
             genesis.to_file(dir.join(config.genesis_file));
             info!(target: "near", "Generated for {chain_id} network node key and genesis file in {}", dir.display());
@@ -972,6 +982,7 @@ pub fn init_configs(
                 gas_price_adjustment_rate: GAS_PRICE_ADJUSTMENT_RATE,
                 block_producer_kickout_threshold: BLOCK_PRODUCER_KICKOUT_THRESHOLD,
                 chunk_producer_kickout_threshold: CHUNK_PRODUCER_KICKOUT_THRESHOLD,
+                chunk_validator_only_kickout_threshold: CHUNK_VALIDATOR_ONLY_KICKOUT_THRESHOLD,
                 online_max_threshold: Rational32::new(99, 100),
                 online_min_threshold: Rational32::new(BLOCK_PRODUCER_KICKOUT_THRESHOLD as i32, 100),
                 validators: vec![AccountInfo {
@@ -1005,7 +1016,7 @@ pub fn create_testnet_configs_from_seeds(
     local_ports: bool,
     archive: bool,
     tracked_shards: Vec<u64>,
-) -> (Vec<Config>, Vec<InMemoryValidatorSigner>, Vec<InMemorySigner>, Genesis) {
+) -> (Vec<Config>, Vec<ValidatorSigner>, Vec<InMemorySigner>, Genesis) {
     let num_validator_seats = (seeds.len() - num_non_validator_seats as usize) as NumSeats;
     let validator_signers =
         seeds.iter().map(|seed| create_test_signer(seed.as_str())).collect::<Vec<_>>();
@@ -1047,7 +1058,7 @@ pub fn create_testnet_configs_from_seeds(
             config.network.skip_sync_wait = num_validator_seats == 1;
         }
         config.archive = archive;
-        config.tracked_shards = tracked_shards.clone();
+        config.tracked_shards.clone_from(&tracked_shards);
         config.consensus.min_num_peers =
             std::cmp::min(num_validator_seats as usize - 1, config.consensus.min_num_peers);
         configs.push(config);
@@ -1065,8 +1076,7 @@ pub fn create_testnet_configs(
     local_ports: bool,
     archive: bool,
     tracked_shards: Vec<u64>,
-) -> (Vec<Config>, Vec<InMemoryValidatorSigner>, Vec<InMemorySigner>, Genesis, Vec<InMemorySigner>)
-{
+) -> (Vec<Config>, Vec<ValidatorSigner>, Vec<InMemorySigner>, Genesis, Vec<InMemorySigner>) {
     let shard_keys = vec![];
     let (configs, validator_signers, network_signers, genesis) = create_testnet_configs_from_seeds(
         (0..(num_validator_seats + num_non_validator_seats))
@@ -1227,7 +1237,7 @@ pub fn load_config(
     let validator_file = dir.join(&config.validator_key_file);
     let validator_signer = if validator_file.exists() {
         match InMemoryValidatorSigner::from_file(&validator_file) {
-            Ok(signer) => Some(Arc::new(signer) as Arc<dyn ValidatorSigner>),
+            Ok(signer) => Some(Arc::new(signer.into())),
             Err(_) => {
                 let error_message = format!(
                     "Failed initializing validator signer from {}",
@@ -1319,7 +1329,7 @@ pub fn load_test_config(seed: &str, addr: tcp::ListenerAddr, genesis: Genesis) -
     } else {
         let signer =
             Arc::new(InMemorySigner::from_seed(seed.parse().unwrap(), KeyType::ED25519, seed));
-        let validator_signer = Arc::new(create_test_signer(seed)) as Arc<dyn ValidatorSigner>;
+        let validator_signer = Arc::new(create_test_signer(seed)) as Arc<ValidatorSigner>;
         (signer, Some(validator_signer))
     };
     NearConfig::new(config, genesis, signer.into(), validator_signer).unwrap()
@@ -1331,6 +1341,7 @@ mod tests {
     use std::path::Path;
     use std::str::FromStr;
 
+    use near_async::time::Duration;
     use near_chain_configs::{GCConfig, Genesis, GenesisValidationMode};
     use near_crypto::InMemorySigner;
     use near_primitives::shard_layout::account_id_to_shard_id;
@@ -1480,14 +1491,27 @@ mod tests {
             // values is probably not worth it but there may be some other defaults
             // we want to ensure that they happen.
             let want_gc = if has_gc {
-                GCConfig { gc_blocks_limit: 42, gc_fork_clean_step: 420, gc_num_epochs_to_keep: 24 }
+                GCConfig {
+                    gc_blocks_limit: 42,
+                    gc_fork_clean_step: 420,
+                    gc_num_epochs_to_keep: 24,
+                    gc_step_period: Duration::seconds(1),
+                }
             } else {
-                GCConfig { gc_blocks_limit: 2, gc_fork_clean_step: 100, gc_num_epochs_to_keep: 5 }
+                GCConfig {
+                    gc_blocks_limit: 2,
+                    gc_fork_clean_step: 100,
+                    gc_num_epochs_to_keep: 5,
+                    gc_step_period: Duration::seconds(1),
+                }
             };
             assert_eq!(want_gc, config.gc);
 
             assert_eq!(
-                vec!["https://explorer.mainnet.near.org/api/nodes".to_string()],
+                vec![
+                    "https://explorer.mainnet.near.org/api/nodes".to_string(),
+                    "https://telemetry.nearone.org/nodes".to_string()
+                ],
                 config.telemetry.endpoints
             );
         }

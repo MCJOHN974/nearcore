@@ -1,3 +1,4 @@
+use crate::config::SocketOptions;
 use crate::network_protocol::testonly as data;
 use crate::network_protocol::PeerMessage;
 use crate::network_protocol::{Encoding, Handshake, OwnedAccount, PartialEdgeInfo};
@@ -11,6 +12,7 @@ use crate::private_actix::RegisterPeerError;
 use crate::tcp;
 use crate::testonly::make_rng;
 use crate::testonly::stream::Stream;
+use crate::types::Edge;
 use near_async::time;
 use near_o11y::testonly::init_test_logger;
 use near_primitives::version::PROTOCOL_VERSION;
@@ -83,7 +85,9 @@ async fn loop_connection() {
     );
 
     // An inbound connection pretending to be a loop should be rejected.
-    let stream = tcp::Stream::connect(&pm.peer_info(), tcp::Tier::T2).await.unwrap();
+    let stream = tcp::Stream::connect(&pm.peer_info(), tcp::Tier::T2, &SocketOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id();
     let port = stream.local_addr.port();
     let mut events = pm.events.from_now();
@@ -99,7 +103,7 @@ async fn loop_connection() {
             partial_edge_info: PartialEdgeInfo::new(
                 &pm.cfg.node_id(),
                 &pm.cfg.node_id(),
-                1,
+                Edge::create_fresh_nonce(&clock.clock()),
                 &pm.cfg.node_key,
             ),
             owned_account: None,
@@ -141,7 +145,9 @@ async fn owned_account_mismatch() {
     .await;
 
     // An inbound connection pretending to be a loop should be rejected.
-    let stream = tcp::Stream::connect(&pm.peer_info(), tcp::Tier::T2).await.unwrap();
+    let stream = tcp::Stream::connect(&pm.peer_info(), tcp::Tier::T2, &SocketOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id();
     let port = stream.local_addr.port();
     let mut events = pm.events.from_now();
@@ -159,7 +165,7 @@ async fn owned_account_mismatch() {
             partial_edge_info: PartialEdgeInfo::new(
                 &cfg.node_id(),
                 &pm.cfg.node_id(),
-                1,
+                Edge::create_fresh_nonce(&clock.clock()),
                 &cfg.node_key,
             ),
             owned_account: Some(
@@ -205,7 +211,7 @@ async fn owned_account_conflict() {
 
     let cfg1 = chain.make_config(rng);
     let mut cfg2 = chain.make_config(rng);
-    cfg2.validator = cfg1.validator.clone();
+    cfg2.validator.clone_from(&cfg1.validator);
 
     // Start 2 connections with the same account_key.
     // The second should be rejected.
@@ -244,25 +250,34 @@ async fn invalid_edge() {
     let chain_info = peer_manager::testonly::make_chain_info(&chain, &[&cfg]);
     pm.set_chain_info(chain_info).await;
 
+    let nonce = Edge::create_fresh_nonce(&clock.clock());
+
     let testcases = [
         (
             "wrong key",
-            PartialEdgeInfo::new(&cfg.node_id(), &pm.cfg.node_id(), 1, &data::make_secret_key(rng)),
+            PartialEdgeInfo::new(
+                &cfg.node_id(),
+                &pm.cfg.node_id(),
+                nonce,
+                &data::make_secret_key(rng),
+            ),
         ),
         (
             "wrong source",
-            PartialEdgeInfo::new(&data::make_peer_id(rng), &pm.cfg.node_id(), 1, &cfg.node_key),
+            PartialEdgeInfo::new(&data::make_peer_id(rng), &pm.cfg.node_id(), nonce, &cfg.node_key),
         ),
         (
             "wrong target",
-            PartialEdgeInfo::new(&cfg.node_id(), &data::make_peer_id(rng), 1, &cfg.node_key),
+            PartialEdgeInfo::new(&cfg.node_id(), &data::make_peer_id(rng), nonce, &cfg.node_key),
         ),
     ];
 
     for (name, edge) in &testcases {
         for tier in [tcp::Tier::T1, tcp::Tier::T2] {
             tracing::info!(target:"test","{name} {tier:?}");
-            let stream = tcp::Stream::connect(&pm.peer_info(), tier).await.unwrap();
+            let stream = tcp::Stream::connect(&pm.peer_info(), tier, &SocketOptions::default())
+                .await
+                .unwrap();
             let stream_id = stream.id();
             let port = stream.local_addr.port();
             let mut events = pm.events.from_now();

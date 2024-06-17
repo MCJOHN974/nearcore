@@ -5,7 +5,7 @@ use near_crypto::PublicKey;
 use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::state_record::StateRecord;
-use near_primitives::types::{AccountId, AccountInfo};
+use near_primitives::types::{AccountId, AccountInfo, StorageUsage};
 use near_primitives::utils;
 use near_primitives::version::ProtocolVersion;
 use near_primitives_core::account::{AccessKey, Account};
@@ -51,11 +51,11 @@ impl AccountRecords {
     fn new(
         amount: Balance,
         locked: Balance,
-        nonrefundable: Balance,
+        permanent_storage_bytes: StorageUsage,
         num_bytes_account: u64,
     ) -> Self {
         let mut ret = Self::default();
-        ret.set_account(amount, locked, nonrefundable, num_bytes_account);
+        ret.set_account(amount, locked, permanent_storage_bytes, num_bytes_account);
         ret
     }
 
@@ -70,14 +70,14 @@ impl AccountRecords {
         &mut self,
         amount: Balance,
         locked: Balance,
-        nonrefundable: Balance,
+        permanent_storage_bytes: StorageUsage,
         num_bytes_account: u64,
     ) {
         assert!(self.account.is_none());
         let account = Account::new(
             amount,
             locked,
-            nonrefundable,
+            permanent_storage_bytes,
             CryptoHash::default(),
             num_bytes_account,
             PROTOCOL_VERSION,
@@ -200,7 +200,7 @@ fn parse_extra_records(
                         let r = AccountRecords::new(
                             account.amount(),
                             account.locked(),
-                            account.nonrefundable(),
+                            account.permanent_storage_bytes(),
                             num_bytes_account,
                         );
                         e.insert(r);
@@ -217,7 +217,7 @@ fn parse_extra_records(
                         r.set_account(
                             account.amount(),
                             account.locked(),
-                            account.nonrefundable(),
+                            account.permanent_storage_bytes(),
                             num_bytes_account,
                         );
                     }
@@ -277,8 +277,11 @@ pub struct GenesisChanges {
     pub epoch_length: Option<BlockHeightDelta>,
     pub transaction_validity_period: Option<NumBlocks>,
     pub protocol_reward_rate: Option<Rational32>,
+    pub max_inflation_rate: Option<Rational32>,
     pub block_producer_kickout_threshold: Option<u8>,
     pub chunk_producer_kickout_threshold: Option<u8>,
+    pub chunk_validator_only_kickout_threshold: Option<u8>,
+    pub gas_limit: Option<u64>,
     pub min_gas_price: Option<Balance>,
     pub max_gas_price: Option<Balance>,
 }
@@ -375,7 +378,7 @@ pub fn amend_genesis(
     // here we have already checked that there are no duplicate validators in wanted_records()
     genesis.config.validators = validators;
     if let Some(chain_id) = &genesis_changes.chain_id {
-        genesis.config.chain_id = chain_id.clone();
+        genesis.config.chain_id.clone_from(&chain_id);
     }
     if let Some(shard_layout) = shard_layout {
         genesis.config.shard_layout = shard_layout;
@@ -398,11 +401,20 @@ pub fn amend_genesis(
     if let Some(r) = genesis_changes.protocol_reward_rate {
         genesis.config.protocol_reward_rate = r;
     }
+    if let Some(r) = genesis_changes.max_inflation_rate {
+        genesis.config.max_inflation_rate = r;
+    }
     if let Some(t) = genesis_changes.block_producer_kickout_threshold {
         genesis.config.block_producer_kickout_threshold = t;
     }
     if let Some(t) = genesis_changes.chunk_producer_kickout_threshold {
         genesis.config.chunk_producer_kickout_threshold = t;
+    }
+    if let Some(t) = genesis_changes.chunk_validator_only_kickout_threshold {
+        genesis.config.chunk_validator_only_kickout_threshold = t;
+    }
+    if let Some(l) = genesis_changes.gas_limit {
+        genesis.config.gas_limit = l;
     }
     if let Some(p) = genesis_changes.min_gas_price {
         genesis.config.min_gas_price = p;
@@ -472,12 +484,12 @@ mod test {
         fn parse(&self) -> StateRecord {
             match &self {
                 Self::Account { account_id, amount, locked, storage_usage } => {
-                    // `nonrefundable_balance` can be implemented if this is required in state records.
-                    let nonrefundable_balance = 0;
+                    // `permanent_storage_bytes` can be implemented if this is required in state records.
+                    let permanent_storage_bytes = 0;
                     let account = Account::new(
                         *amount,
                         *locked,
-                        nonrefundable_balance,
+                        permanent_storage_bytes,
                         CryptoHash::default(),
                         *storage_usage,
                         PROTOCOL_VERSION,
@@ -633,6 +645,8 @@ mod test {
                     near_chain_configs::BLOCK_PRODUCER_KICKOUT_THRESHOLD,
                 chunk_producer_kickout_threshold:
                     near_chain_configs::CHUNK_PRODUCER_KICKOUT_THRESHOLD,
+                chunk_validator_only_kickout_threshold:
+                    near_chain_configs::CHUNK_VALIDATOR_ONLY_KICKOUT_THRESHOLD,
                 online_max_threshold: Rational32::new(99, 100),
                 online_min_threshold: Rational32::new(
                     near_chain_configs::BLOCK_PRODUCER_KICKOUT_THRESHOLD as i32,

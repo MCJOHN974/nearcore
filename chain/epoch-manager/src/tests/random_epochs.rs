@@ -56,7 +56,7 @@ fn do_random_test<RngImpl: Rng>(
         ("test2".parse().unwrap(), stake_amount),
         ("test3".parse().unwrap(), stake_amount),
     ];
-    let mut epoch_manager = setup_default_epoch_manager(validators, epoch_length, 1, 3, 0, 90, 60);
+    let mut epoch_manager = setup_default_epoch_manager(validators, epoch_length, 1, 3, 90, 60);
     let h = hash_range(num_heights as usize);
     let skip_height_probability = rng.gen_range(0.0..1.0) * rng.gen_range(0.0..1.0);
 
@@ -184,7 +184,7 @@ fn verify_epochs(epoch_infos: &[Arc<EpochInfo>]) {
         let mut stakes_with_change = stakes_before_change.clone();
         for (account_id, new_stake) in epoch_info.stake_change() {
             if *new_stake == 0 {
-                if stakes_before_change.get(account_id).is_none() {
+                if !stakes_before_change.contains_key(account_id) {
                     // Stake change from 0 to 0
                     assert!(prev_epoch_info.validator_kickout().contains_key(account_id));
                     assert!(epoch_info.validator_kickout().contains_key(account_id));
@@ -347,14 +347,14 @@ fn verify_block_stats(
                     .get(&shard_id)
                     .unwrap()
                     .values()
-                    .map(|value| value.produced)
+                    .map(|value| value.produced())
                     .sum::<u64>();
                 let sum_expected = aggregator
                     .shard_tracker
                     .get(&shard_id)
                     .unwrap()
                     .values()
-                    .map(|value| value.expected)
+                    .map(|value| value.expected())
                     .sum::<u64>();
                 assert_eq!(sum_produced, blocks_in_epoch);
                 assert_eq!(sum_expected, blocks_in_epoch_expected);

@@ -13,15 +13,16 @@ use crate::block_header::{
 use crate::block_header::{BlockHeaderInnerRestV4, BlockHeaderV4};
 use crate::challenge::{Challenge, ChallengesResult};
 use crate::checked_feature;
+use crate::congestion_info::{CongestionInfo, CongestionInfoV1};
 use crate::errors::TxExecutionError;
 use crate::hash::{hash, CryptoHash};
 use crate::merkle::{combine_hash, MerklePath};
 use crate::network::PeerId;
-use crate::receipt::{ActionReceipt, DataReceipt, DataReceiver, Receipt, ReceiptEnum};
+use crate::receipt::{ActionReceipt, DataReceipt, DataReceiver, Receipt, ReceiptEnum, ReceiptV1};
 use crate::serialize::dec_format;
 use crate::sharding::{
     ChunkHash, ShardChunk, ShardChunkHeader, ShardChunkHeaderInner, ShardChunkHeaderInnerV2,
-    ShardChunkHeaderV3,
+    ShardChunkHeaderInnerV3, ShardChunkHeaderV3,
 };
 #[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
 use crate::transaction::NonrefundableStorageTransferAction;
@@ -39,11 +40,13 @@ use crate::types::{
 };
 use crate::version::{ProtocolVersion, Version};
 use borsh::{BorshDeserialize, BorshSerialize};
-use near_async::time::Utc;
 use near_crypto::{PublicKey, Signature};
 use near_fmt::{AbbrBytes, Slice};
+use near_parameters::config::CongestionControlConfig;
+use near_parameters::view::CongestionControlConfigView;
 use near_parameters::{ActionCosts, ExtCosts};
 use near_primitives_core::version::PROTOCOL_VERSION;
+use near_time::Utc;
 use serde_with::base64::Base64;
 use serde_with::serde_as;
 use std::collections::HashMap;
@@ -62,7 +65,7 @@ pub struct AccountView {
     pub locked: Balance,
     #[serde(with = "dec_format")]
     #[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
-    pub nonrefundable: Balance,
+    pub permanent_storage_bytes: StorageUsage,
     pub code_hash: CryptoHash,
     pub storage_usage: StorageUsage,
     /// TODO(2271): deprecated.
@@ -89,6 +92,8 @@ pub struct ViewApplyState {
     pub prev_block_hash: CryptoHash,
     /// Currently building block hash
     pub block_hash: CryptoHash,
+    /// To which shard the applied chunk belongs.
+    pub shard_id: ShardId,
     /// Current epoch id
     pub epoch_id: EpochId,
     /// Current epoch height
@@ -107,7 +112,7 @@ impl From<&Account> for AccountView {
             amount: account.amount(),
             locked: account.locked(),
             #[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
-            nonrefundable: account.nonrefundable(),
+            permanent_storage_bytes: account.permanent_storage_bytes(),
             code_hash: account.code_hash(),
             storage_usage: account.storage_usage(),
             storage_paid_at: 0,
@@ -124,13 +129,13 @@ impl From<Account> for AccountView {
 impl From<&AccountView> for Account {
     fn from(view: &AccountView) -> Self {
         #[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
-        let nonrefundable = view.nonrefundable;
+        let permanent_storage_bytes = view.permanent_storage_bytes;
         #[cfg(not(feature = "protocol_feature_nonrefundable_transfer_nep491"))]
-        let nonrefundable = 0;
+        let permanent_storage_bytes = 0;
         Account::new(
             view.amount,
             view.locked,
-            nonrefundable,
+            permanent_storage_bytes,
             view.code_hash,
             view.storage_usage,
             PROTOCOL_VERSION,
@@ -351,12 +356,12 @@ pub struct StatusSyncInfo {
     pub latest_block_hash: CryptoHash,
     pub latest_block_height: BlockHeight,
     pub latest_state_root: CryptoHash,
-    #[serde(with = "near_async::time::serde_utc_as_iso")]
+    #[serde(with = "near_time::serde_utc_as_iso")]
     pub latest_block_time: Utc,
     pub syncing: bool,
     pub earliest_block_hash: Option<CryptoHash>,
     pub earliest_block_height: Option<BlockHeight>,
-    #[serde(with = "near_async::time::serde_opt_utc_as_iso")]
+    #[serde(with = "near_time::serde_opt_utc_as_iso")]
     pub earliest_block_time: Option<Utc>,
     pub epoch_id: Option<EpochId>,
     pub epoch_start_height: Option<BlockHeight>,
@@ -409,7 +414,7 @@ pub struct AccountDataView {
     pub peer_id: PublicKey,
     pub proxies: Vec<Tier1ProxyView>,
     pub account_key: PublicKey,
-    #[serde(with = "near_async::time::serde_utc_as_iso")]
+    #[serde(with = "near_time::serde_utc_as_iso")]
     pub timestamp: Utc,
 }
 
@@ -591,7 +596,7 @@ pub struct ChainProcessingInfo {
 pub struct BlockProcessingInfo {
     pub height: BlockHeight,
     pub hash: CryptoHash,
-    #[serde(with = "near_async::time::serde_utc_as_iso")]
+    #[serde(with = "near_time::serde_utc_as_iso")]
     pub received_timestamp: Utc,
     /// Time (in ms) between when the block was first received and when it was processed
     pub in_progress_ms: u128,
@@ -657,10 +662,10 @@ pub struct ChunkProcessingInfo {
     pub created_by: Option<AccountId>,
     pub status: ChunkProcessingStatus,
     /// Timestamp of first time when we request for this chunk.
-    #[serde(with = "near_async::time::serde_opt_utc_as_iso")]
+    #[serde(with = "near_time::serde_opt_utc_as_iso")]
     pub requested_timestamp: Option<Utc>,
     /// Timestamp of when the chunk is complete
-    #[serde(with = "near_async::time::serde_opt_utc_as_iso")]
+    #[serde(with = "near_time::serde_opt_utc_as_iso")]
     pub completed_timestamp: Option<Utc>,
     /// Time (in millis) that it takes between when the chunk is requested and when it is completed.
     pub request_duration: Option<u64>,
@@ -671,13 +676,13 @@ pub struct ChunkProcessingInfo {
 pub struct PartCollectionInfo {
     pub part_owner: AccountId,
     // Time when the part is received through any message
-    #[serde(with = "near_async::time::serde_opt_utc_as_iso")]
+    #[serde(with = "near_time::serde_opt_utc_as_iso")]
     pub received_time: Option<Utc>,
     // Time when we receive a PartialEncodedChunkForward containing this part
-    #[serde(with = "near_async::time::serde_opt_utc_as_iso")]
+    #[serde(with = "near_time::serde_opt_utc_as_iso")]
     pub forwarded_received_time: Option<Utc>,
     // Time when we receive the PartialEncodedChunk message containing this part
-    #[serde(with = "near_async::time::serde_opt_utc_as_iso")]
+    #[serde(with = "near_time::serde_opt_utc_as_iso")]
     pub chunk_received_time: Option<Utc>,
 }
 
@@ -726,6 +731,8 @@ pub struct StatusResponse {
     pub node_key: Option<PublicKey>,
     /// Uptime of the node.
     pub uptime_sec: i64,
+    /// Genesis hash of the chain.
+    pub genesis_hash: CryptoHash,
     /// Information about last blocks, network, epoch and chain & chunk info.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detailed_debug_status: Option<DetailedDebugStatus>,
@@ -1060,6 +1067,7 @@ pub struct ChunkHeaderView {
     pub outgoing_receipts_root: CryptoHash,
     pub tx_root: CryptoHash,
     pub validator_proposals: Vec<ValidatorStakeView>,
+    pub congestion_info: Option<CongestionInfoView>,
     pub signature: Signature,
 }
 
@@ -1087,6 +1095,7 @@ impl From<ShardChunkHeader> for ChunkHeaderView {
             outgoing_receipts_root: *inner.prev_outgoing_receipts_root(),
             tx_root: *inner.tx_root(),
             validator_proposals: inner.prev_validator_proposals().map(Into::into).collect(),
+            congestion_info: inner.congestion_info().map(Into::into),
             signature,
         }
     }
@@ -1094,32 +1103,62 @@ impl From<ShardChunkHeader> for ChunkHeaderView {
 
 impl From<ChunkHeaderView> for ShardChunkHeader {
     fn from(view: ChunkHeaderView) -> Self {
-        let mut header = ShardChunkHeaderV3 {
-            inner: ShardChunkHeaderInner::V2(ShardChunkHeaderInnerV2 {
-                prev_block_hash: view.prev_block_hash,
-                prev_state_root: view.prev_state_root,
-                prev_outcome_root: view.outcome_root,
-                encoded_merkle_root: view.encoded_merkle_root,
-                encoded_length: view.encoded_length,
-                height_created: view.height_created,
-                shard_id: view.shard_id,
-                prev_gas_used: view.gas_used,
-                gas_limit: view.gas_limit,
-                prev_balance_burnt: view.balance_burnt,
-                prev_outgoing_receipts_root: view.outgoing_receipts_root,
-                tx_root: view.tx_root,
-                prev_validator_proposals: view
-                    .validator_proposals
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            }),
-            height_included: view.height_included,
-            signature: view.signature,
-            hash: ChunkHash::default(),
-        };
-        header.init();
-        ShardChunkHeader::V3(header)
+        if let Some(congestion_info) = view.congestion_info {
+            let mut header = ShardChunkHeaderV3 {
+                inner: ShardChunkHeaderInner::V3(ShardChunkHeaderInnerV3 {
+                    prev_block_hash: view.prev_block_hash,
+                    prev_state_root: view.prev_state_root,
+                    prev_outcome_root: view.outcome_root,
+                    encoded_merkle_root: view.encoded_merkle_root,
+                    encoded_length: view.encoded_length,
+                    height_created: view.height_created,
+                    shard_id: view.shard_id,
+                    prev_gas_used: view.gas_used,
+                    gas_limit: view.gas_limit,
+                    prev_balance_burnt: view.balance_burnt,
+                    prev_outgoing_receipts_root: view.outgoing_receipts_root,
+                    tx_root: view.tx_root,
+                    prev_validator_proposals: view
+                        .validator_proposals
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                    congestion_info: congestion_info.into(),
+                }),
+                height_included: view.height_included,
+                signature: view.signature,
+                hash: ChunkHash::default(),
+            };
+            header.init();
+            ShardChunkHeader::V3(header)
+        } else {
+            let mut header = ShardChunkHeaderV3 {
+                inner: ShardChunkHeaderInner::V2(ShardChunkHeaderInnerV2 {
+                    prev_block_hash: view.prev_block_hash,
+                    prev_state_root: view.prev_state_root,
+                    prev_outcome_root: view.outcome_root,
+                    encoded_merkle_root: view.encoded_merkle_root,
+                    encoded_length: view.encoded_length,
+                    height_created: view.height_created,
+                    shard_id: view.shard_id,
+                    prev_gas_used: view.gas_used,
+                    gas_limit: view.gas_limit,
+                    prev_balance_burnt: view.balance_burnt,
+                    prev_outgoing_receipts_root: view.outgoing_receipts_root,
+                    tx_root: view.tx_root,
+                    prev_validator_proposals: view
+                        .validator_proposals
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                }),
+                height_included: view.height_included,
+                signature: view.signature,
+                hash: ChunkHash::default(),
+            };
+            header.init();
+            ShardChunkHeader::V3(header)
+        }
     }
 }
 
@@ -1316,6 +1355,7 @@ pub struct SignedTransactionView {
     pub nonce: Nonce,
     pub receiver_id: AccountId,
     pub actions: Vec<ActionView>,
+    pub priority_fee: u64,
     pub signature: Signature,
     pub hash: CryptoHash,
 }
@@ -1323,19 +1363,17 @@ pub struct SignedTransactionView {
 impl From<SignedTransaction> for SignedTransactionView {
     fn from(signed_tx: SignedTransaction) -> Self {
         let hash = signed_tx.get_hash();
+        let transaction = signed_tx.transaction;
+        let priority_fee = transaction.priority_fee().unwrap_or_default();
         SignedTransactionView {
-            signer_id: signed_tx.transaction.signer_id,
-            public_key: signed_tx.transaction.public_key,
-            nonce: signed_tx.transaction.nonce,
-            receiver_id: signed_tx.transaction.receiver_id,
-            actions: signed_tx
-                .transaction
-                .actions
-                .into_iter()
-                .map(|action| action.into())
-                .collect(),
+            signer_id: transaction.signer_id().clone(),
+            public_key: transaction.public_key().clone(),
+            nonce: transaction.nonce(),
+            receiver_id: transaction.receiver_id().clone(),
+            actions: transaction.take_actions().into_iter().map(|action| action.into()).collect(),
             signature: signed_tx.signature,
             hash,
+            priority_fee,
         }
     }
 }
@@ -1714,18 +1752,18 @@ pub enum TxExecutionStatus {
     /// Transaction is included into the block. The block may be not finalised yet
     Included,
     /// Transaction is included into the block +
-    /// All the transaction receipts finished their execution.
+    /// All non-refund transaction receipts finished their execution.
     /// The corresponding blocks for tx and each receipt may be not finalised yet
     #[default]
     ExecutedOptimistic,
     /// Transaction is included into finalised block
     IncludedFinal,
     /// Transaction is included into finalised block +
-    /// All the transaction receipts finished their execution.
+    /// All non-refund transaction receipts finished their execution.
     /// The corresponding blocks for each receipt may be not finalised yet
     Executed,
     /// Transaction is included into finalised block +
-    /// Execution of transaction receipts is finalised
+    /// Execution of all transaction receipts is finalised, including refund receipts
     Final,
 }
 
@@ -1756,7 +1794,7 @@ impl TxStatusView {
     }
 }
 
-/// Execution outcome of the transaction and all of subsequent the receipts.
+/// Execution outcome of the transaction and all the subsequent receipts.
 /// Could be not finalised yet
 #[derive(
     BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone,
@@ -1896,6 +1934,7 @@ pub struct ReceiptView {
     pub receipt_id: CryptoHash,
 
     pub receipt: ReceiptEnumView,
+    pub priority: u64,
 }
 
 #[derive(
@@ -1933,26 +1972,36 @@ pub enum ReceiptEnumView {
         output_data_receivers: Vec<DataReceiverView>,
         input_data_ids: Vec<CryptoHash>,
         actions: Vec<ActionView>,
+        #[serde(default = "default_is_promise")]
         is_promise_yield: bool,
     },
     Data {
         data_id: CryptoHash,
         #[serde_as(as = "Option<Base64>")]
         data: Option<Vec<u8>>,
+        #[serde(default = "default_is_promise")]
         is_promise_resume: bool,
     },
 }
 
+// Default value used when deserializing ReceiptEnumViews which are missing either the
+// `is_promise_yield` or `is_promise_resume` fields. Data which is missing this field was
+// serialized before the introduction of yield execution.
+fn default_is_promise() -> bool {
+    false
+}
+
 impl From<Receipt> for ReceiptView {
     fn from(receipt: Receipt) -> Self {
-        let is_promise_yield = matches!(&receipt.receipt, ReceiptEnum::PromiseYield(_));
-        let is_promise_resume = matches!(&receipt.receipt, ReceiptEnum::PromiseResume(_));
+        let is_promise_yield = matches!(receipt.receipt(), ReceiptEnum::PromiseYield(_));
+        let is_promise_resume = matches!(receipt.receipt(), ReceiptEnum::PromiseResume(_));
+        let priority = receipt.priority().value();
 
         ReceiptView {
-            predecessor_id: receipt.predecessor_id,
-            receiver_id: receipt.receiver_id,
-            receipt_id: receipt.receipt_id,
-            receipt: match receipt.receipt {
+            predecessor_id: receipt.predecessor_id().clone(),
+            receiver_id: receipt.receiver_id().clone(),
+            receipt_id: *receipt.receipt_id(),
+            receipt: match receipt.take_receipt() {
                 ReceiptEnum::Action(action_receipt) | ReceiptEnum::PromiseYield(action_receipt) => {
                     ReceiptEnumView::Action {
                         signer_id: action_receipt.signer_id,
@@ -1983,6 +2032,7 @@ impl From<Receipt> for ReceiptView {
                     }
                 }
             },
+            priority,
         }
     }
 }
@@ -1991,7 +2041,7 @@ impl TryFrom<ReceiptView> for Receipt {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn try_from(receipt_view: ReceiptView) -> Result<Self, Self::Error> {
-        Ok(Receipt {
+        Ok(Receipt::V1(ReceiptV1 {
             predecessor_id: receipt_view.predecessor_id,
             receiver_id: receipt_view.receiver_id,
             receipt_id: receipt_view.receipt_id,
@@ -2039,7 +2089,8 @@ impl TryFrom<ReceiptView> for Receipt {
                     }
                 }
             },
-        })
+            priority: receipt_view.priority,
+        }))
     }
 }
 
@@ -2098,6 +2149,18 @@ pub struct CurrentEpochValidatorInfo {
     pub num_produced_chunks_per_shard: Vec<NumBlocks>,
     #[serde(default)]
     pub num_expected_chunks_per_shard: Vec<NumBlocks>,
+    #[serde(default, skip_serializing_if = "num_blocks_is_zero")]
+    pub num_produced_endorsements: NumBlocks,
+    #[serde(default, skip_serializing_if = "num_blocks_is_zero")]
+    pub num_expected_endorsements: NumBlocks,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub num_produced_endorsements_per_shard: Vec<NumBlocks>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub num_expected_endorsements_per_shard: Vec<NumBlocks>,
+}
+
+fn num_blocks_is_zero(n: &NumBlocks) -> bool {
+    n == &0
 }
 
 #[derive(
@@ -2397,6 +2460,59 @@ pub struct SplitStorageInfoView {
     pub cold_head_height: Option<BlockHeight>,
 
     pub hot_db_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CongestionInfoView {
+    #[serde(with = "dec_format")]
+    pub delayed_receipts_gas: u128,
+
+    #[serde(with = "dec_format")]
+    pub buffered_receipts_gas: u128,
+
+    pub receipt_bytes: u64,
+
+    pub allowed_shard: u16,
+}
+
+impl From<CongestionInfo> for CongestionInfoView {
+    fn from(congestion_info: CongestionInfo) -> Self {
+        match congestion_info {
+            CongestionInfo::V1(congestion_info) => congestion_info.into(),
+        }
+    }
+}
+
+impl From<CongestionInfoV1> for CongestionInfoView {
+    fn from(congestion_info: CongestionInfoV1) -> Self {
+        Self {
+            delayed_receipts_gas: congestion_info.delayed_receipts_gas,
+            buffered_receipts_gas: congestion_info.buffered_receipts_gas,
+            receipt_bytes: congestion_info.receipt_bytes,
+            allowed_shard: congestion_info.allowed_shard,
+        }
+    }
+}
+
+impl From<CongestionInfoView> for CongestionInfo {
+    fn from(_: CongestionInfoView) -> Self {
+        CongestionInfo::default()
+    }
+}
+
+impl CongestionInfoView {
+    pub fn congestion_level(&self, config_view: CongestionControlConfigView) -> f64 {
+        let congestion_config = CongestionControlConfig::from(config_view);
+        // Localized means without considering missed chunks congestion. As far
+        // as clients are concerned, this is the only congestion level that
+        // matters.
+        // Missed chunks congestion exists to reduce incoming load after a
+        // number of chunks were missed. It is not a property of a specific
+        // chunk but rather a property that changes over time. It is even a bit
+        // misleading to call it congestion, as it is not a problem with too
+        // much traffic.
+        CongestionInfo::from(self.clone()).localized_congestion_level(&congestion_config)
+    }
 }
 
 #[cfg(test)]

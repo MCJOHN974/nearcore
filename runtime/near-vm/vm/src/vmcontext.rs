@@ -1,5 +1,5 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/2.3.0/ATTRIBUTIONS.md
 
 //! This file declares `VMContext` and several related structs which contain
 //! fields that compiled wasm code accesses directly.
@@ -7,7 +7,7 @@
 use crate::func_data_registry::VMFuncRef;
 use crate::global::Global;
 use crate::instance::Instance;
-use crate::memory::Memory;
+use crate::memory::LinearMemory;
 use crate::sig_registry::VMSharedSignatureIndex;
 use crate::table::Table;
 use crate::trap::{Trap, TrapCode};
@@ -291,7 +291,7 @@ pub struct VMMemoryImport {
     pub definition: NonNull<VMMemoryDefinition>,
 
     /// A pointer to the `Memory` that owns the memory description.
-    pub from: Arc<dyn Memory>,
+    pub from: Arc<LinearMemory>,
 }
 
 #[cfg(test)]
@@ -1087,7 +1087,7 @@ impl VMContext {
     }
 }
 
-///
+/// Signature/ABI of the trampoline.
 pub type VMTrampoline = unsafe extern "C" fn(
     *mut VMContext,        // callee vmctx
     *const VMFunctionBody, // function we're actually calling

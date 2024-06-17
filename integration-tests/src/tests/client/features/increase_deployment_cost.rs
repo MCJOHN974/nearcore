@@ -15,7 +15,7 @@ use nearcore::test_utils::TestEnvNightshadeSetupExt;
 fn test_deploy_cost_increased() {
     // The immediate protocol upgrade needs to be set for this test to pass in
     // the release branch where the protocol upgrade date is set.
-    std::env::set_var("NEAR_TESTS_IMMEDIATE_PROTOCOL_UPGRADE", "1");
+    std::env::set_var("NEAR_TESTS_PROTOCOL_UPGRADE_OVERRIDE", "now");
 
     let new_protocol_version = ProtocolFeature::IncreaseDeploymentCost.protocol_version();
     let old_protocol_version = new_protocol_version - 1;
@@ -47,7 +47,7 @@ fn test_deploy_cost_increased() {
     let tx = env.tx_from_actions(actions.clone(), &signer, signer.account_id.clone());
     let old_outcome = env.execute_tx(tx).unwrap();
 
-    env.upgrade_protocol(new_protocol_version);
+    env.upgrade_protocol_to_latest_version();
 
     let tx = env.tx_from_actions(actions, &signer, signer.account_id.clone());
     let new_outcome = env.execute_tx(tx).unwrap();

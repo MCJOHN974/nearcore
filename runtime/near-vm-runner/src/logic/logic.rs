@@ -2,6 +2,7 @@ use super::context::VMContext;
 use super::dependencies::{External, MemSlice, MemoryLike};
 use super::errors::{FunctionCallError, InconsistentStateError};
 use super::gas_counter::{FastGasCounter, GasCounter};
+use super::recorded_storage_counter::RecordedStorageCounter;
 use super::types::{PromiseIndex, PromiseResult, ReceiptIndex, ReturnData};
 use super::utils::split_method_names;
 use super::ValuePtr;
@@ -53,6 +54,8 @@ pub struct VMLogic<'a> {
     /// Storage usage of the current account at the moment
     current_storage_usage: StorageUsage,
     gas_counter: GasCounter,
+    /// Tracks size of the recorded trie storage proof.
+    recorded_storage_counter: RecordedStorageCounter,
     /// What method returns.
     return_data: ReturnData,
     /// Logs written by the runtime.
@@ -150,6 +153,10 @@ impl<'a> VMLogic<'a> {
             context.prepaid_gas,
             context.is_view(),
         );
+        let recorded_storage_counter = RecordedStorageCounter::new(
+            ext.get_recorded_storage_size(),
+            config.limit_config.per_receipt_storage_proof_size_limit,
+        );
         Self {
             ext,
             context,
@@ -161,6 +168,7 @@ impl<'a> VMLogic<'a> {
             current_account_locked_balance,
             current_storage_usage,
             gas_counter,
+            recorded_storage_counter,
             return_data: ReturnData::None,
             logs: vec![],
             registers: Default::default(),
@@ -1205,14 +1213,26 @@ impl<'a> VMLogic<'a> {
         self.gas(opcodes as u64 * self.config.regular_op_cost as u64)
     }
 
+    /// An alias for [`VMLogic::gas`].
+    pub fn burn_gas(&mut self, gas: Gas) -> Result<()> {
+        self.gas(gas)
+    }
+
     /// This is the function that is exposed to WASM contracts under the name `gas`.
     ///
     /// For now it is consuming the gas for `gas` opcodes. When we switch to finite-wasm it’ll
     /// be made to be a no-op.
     ///
     /// This function might be intrinsified.
-    pub fn gas_seen_from_wasm(&mut self, gas: u32) -> Result<()> {
-        self.gas_opcodes(gas)
+    pub fn gas_seen_from_wasm(&mut self, opcodes: u32) -> Result<()> {
+        self.gas_opcodes(opcodes)
+    }
+
+    #[cfg(feature = "test_features")]
+    pub fn sleep_nanos(&mut self, nanos: u64) -> Result<()> {
+        let duration = std::time::Duration::from_nanos(nanos);
+        std::thread::sleep(duration);
+        Ok(())
     }
 
     // ################
@@ -1228,8 +1248,8 @@ impl<'a> VMLogic<'a> {
     /// # Cost
     ///
     /// This is a convenience function that encapsulates several costs:
-    /// `burnt_gas := dispatch cost of the receipt + base dispatch cost  cost of the data receipt`
-    /// `used_gas := burnt_gas + exec cost of the receipt + base exec cost  cost of the data receipt`
+    /// `burnt_gas := dispatch cost of the receipt + base dispatch cost of the data receipt`
+    /// `used_gas := burnt_gas + exec cost of the receipt + base exec cost of the data receipt`
     /// Notice that we prepay all base cost upon the creation of the data dependency, we are going to
     /// pay for the content transmitted through the dependency upon the actual creation of the
     /// DataReceipt.
@@ -2565,6 +2585,7 @@ impl<'a> VMLogic<'a> {
         self.gas_counter.add_trie_fees(&nodes_delta)?;
         self.ext.storage_set(&key, &value)?;
         let storage_config = &self.fees_config.storage_usage_config;
+        self.recorded_storage_counter.observe_size(self.ext.get_recorded_storage_size())?;
         match evicted {
             Some(old_value) => {
                 // Inner value can't overflow, because the value length is limited.
@@ -2663,6 +2684,7 @@ impl<'a> VMLogic<'a> {
             tn_mem_reads = nodes_delta.mem_reads,
         );
 
+        self.recorded_storage_counter.observe_size(self.ext.get_recorded_storage_size())?;
         match read {
             Some(value) => {
                 self.registers.set(
@@ -2739,6 +2761,7 @@ impl<'a> VMLogic<'a> {
 
         self.gas_counter.add_trie_fees(&nodes_delta)?;
         let storage_config = &self.fees_config.storage_usage_config;
+        self.recorded_storage_counter.observe_size(self.ext.get_recorded_storage_size())?;
         match removed {
             Some(value) => {
                 // Inner value can't overflow, because the key/value length is limited.
@@ -2804,6 +2827,7 @@ impl<'a> VMLogic<'a> {
         );
 
         self.gas_counter.add_trie_fees(&nodes_delta)?;
+        self.recorded_storage_counter.observe_size(self.ext.get_recorded_storage_size())?;
         Ok(res? as u64)
     }
 
@@ -2890,7 +2914,7 @@ impl<'a> VMLogic<'a> {
     /// * If `iterator_id` does not correspond to an existing iterator returns `InvalidIteratorId`;
     /// * If between the creation of the iterator and calling `storage_iter_next` the range over
     ///   which it iterates was modified returns `IteratorWasInvalidated`. Specifically, if
-    ///   `storage_write` or `storage_remove` was invoked on the key key such that:
+    ///   `storage_write` or `storage_remove` was invoked on the key such that:
     ///   * in case of `storage_iter_prefix`. `key` has the given prefix and:
     ///     * Iterator was not called next yet.
     ///     * `next` was already called on the iterator and it is currently pointing at the `key`

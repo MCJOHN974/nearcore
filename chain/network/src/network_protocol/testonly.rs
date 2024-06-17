@@ -13,9 +13,9 @@ use near_primitives::challenge::{BlockDoubleSign, Challenge, ChallengeBody};
 use near_primitives::hash::CryptoHash;
 use near_primitives::network::{AnnounceAccount, PeerId};
 use near_primitives::num_rational::Ratio;
+use near_primitives::reed_solomon::reed_solomon_encode;
 use near_primitives::sharding::{
-    ChunkHash, EncodedShardChunk, EncodedShardChunkBody, PartialEncodedChunkPart,
-    ReedSolomonWrapper, ShardChunk,
+    ChunkHash, EncodedShardChunkBody, PartialEncodedChunkPart, ShardChunk,
 };
 use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::{AccountId, BlockHeight, EpochId, StateRoot};
@@ -23,6 +23,7 @@ use near_primitives::validator_signer::{InMemoryValidatorSigner, ValidatorSigner
 use near_primitives::version;
 use rand::distributions::Standard;
 use rand::Rng;
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::collections::HashMap;
 use std::net;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ pub fn make_genesis_block(clock: &time::Clock, chunks: Vec<ShardChunk>) -> Block
 
 pub fn make_block(
     clock: &time::Clock,
-    signer: &dyn ValidatorSigner,
+    signer: &ValidatorSigner,
     prev: &Block,
     chunks: Vec<ShardChunk>,
 ) -> Block {
@@ -136,10 +137,6 @@ pub fn make_edge(a: &SecretKey, b: &SecretKey, nonce: u64) -> Edge {
     Edge::new(ap, bp, nonce, a.sign(hash.as_ref()), b.sign(hash.as_ref()))
 }
 
-pub fn make_edge_tombstone(a: &SecretKey, b: &SecretKey) -> Edge {
-    make_edge(a, b, 1).remove_edge(PeerId::new(a.public_key()), &a)
-}
-
 pub fn make_routing_table<R: Rng>(rng: &mut R) -> RoutingTableUpdate {
     let signers: Vec<_> = (0..7).map(|_| make_secret_key(rng)).collect();
     RoutingTableUpdate {
@@ -163,7 +160,7 @@ pub fn make_signed_transaction<R: Rng>(rng: &mut R) -> SignedTransaction {
         rng.gen(),
         sender.account_id.clone(),
         receiver,
-        &sender,
+        &sender.into(),
         15,
         CryptoHash::default(),
     )
@@ -175,7 +172,7 @@ pub fn make_challenge<R: Rng>(rng: &mut R) -> Challenge {
             left_block_header: rng.sample_iter(&Standard).take(65).collect(),
             right_block_header: rng.sample_iter(&Standard).take(34).collect(),
         }),
-        &make_validator_signer(rng),
+        &make_validator_signer(rng).into(),
     )
 }
 
@@ -184,18 +181,17 @@ pub fn make_challenge<R: Rng>(rng: &mut R) -> Challenge {
 // the real thing, since this functionality is not encapsulated in
 // the production code well enough to reuse it in tests.
 pub fn make_chunk_parts(chunk: ShardChunk) -> Vec<PartialEncodedChunkPart> {
-    let mut rs = ReedSolomonWrapper::new(10, 5);
-    let (parts, _) = EncodedShardChunk::encode_transaction_receipts(
-        &mut rs,
-        chunk.transactions().to_vec(),
-        &chunk.prev_outgoing_receipts(),
-    )
-    .unwrap();
+    let total_shard_count = 10;
+    let parity_shard_count = 5;
+    let rs = ReedSolomon::new(total_shard_count, parity_shard_count).unwrap();
+    let transaction_receipts =
+        (chunk.transactions().to_vec(), chunk.prev_outgoing_receipts().to_vec());
+    let (parts, _) = reed_solomon_encode(&rs, transaction_receipts);
+
     let mut content = EncodedShardChunkBody { parts };
-    content.reconstruct(&mut rs).unwrap();
     let (_, merkle_paths) = content.get_merkle_hash_and_paths();
     let mut parts = vec![];
-    for ord in 0..rs.total_shard_count() {
+    for ord in 0..total_shard_count {
         parts.push(PartialEncodedChunkPart {
             part_ord: ord as u64,
             part: content.parts[ord].take().unwrap(),
@@ -251,7 +247,12 @@ impl Chain {
         let signer = make_validator_signer(rng);
         for _ in 1..block_count {
             clock.advance(time::Duration::seconds(15));
-            blocks.push(make_block(&clock.clock(), &signer, blocks.last().unwrap(), chunks.make()));
+            blocks.push(make_block(
+                &clock.clock(),
+                &signer.clone().into(),
+                blocks.last().unwrap(),
+                chunks.make(),
+            ));
         }
         Chain {
             genesis_id: GenesisId {
@@ -318,7 +319,7 @@ impl Chain {
                 let peer_id = make_peer_id(rng);
                 Arc::new(
                     make_account_data(rng, 1, clock.now_utc(), v.public_key(), peer_id)
-                        .sign(v)
+                        .sign(&v.clone().into())
                         .unwrap(),
                 )
             })
@@ -404,7 +405,9 @@ pub fn make_account_data(
 pub fn make_signed_account_data(rng: &mut impl Rng, clock: &time::Clock) -> SignedAccountData {
     let signer = make_validator_signer(rng);
     let peer_id = make_peer_id(rng);
-    make_account_data(rng, 1, clock.now_utc(), signer.public_key(), peer_id).sign(&signer).unwrap()
+    make_account_data(rng, 1, clock.now_utc(), signer.public_key(), peer_id)
+        .sign(&signer.into())
+        .unwrap()
 }
 
 // Accessors for creating malformed SignedAccountData

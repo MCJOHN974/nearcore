@@ -54,11 +54,23 @@ hundred of users.
 In the Locust UI, check the "Workers" tab to see CPU and memory usage. If this
 approaches anything close to 100%, you should use more workers.
 
-Luckily, locust has the ability to swarm the load generation across many processes.
-To use it, start one process with the `--master` argument and as many as you
-like with `--worker`. (If they run on different machines, you also need to
-provide `--master-host` and `--master-port`, if running on the same machine it
-will work automagically.)
+Luckily, Locust has the ability to swarm the load generation across many processes.
+
+The simplest way to do this on a single machine is to use `--processes` argument:
+```sh
+locust -H 127.0.0.1:3030 \
+  -f locustfiles/ft.py \
+  --funding-key=$KEY \
+  --processes 8
+```
+
+This will spawn 8 Locust Python processes, each capable of fully utilizing one CPU core.
+According to the current measurements, Locust on a single CPU core can send 500 transactions per
+second, and this number linearly scales with the number of processes. 
+
+To scale further to multiple machines, start one process with the `--master` argument and as many as
+you like with `--worker`. (If they run on different machines, you also need to provide
+`--master-host` and `--master-port`, if running on the same machine it will work automagically.)
 
 Start the master:
 
@@ -129,6 +141,7 @@ Currently supported load types:
 | Congestion | congestion.py | (`--congestion-wasm $WASM_PATH`) | Creates a single instance of Congestion contract. Users run large and long transactions. |
 | Sweat (normal load) | sweat.py | (`--sweat-wasm $WASM_PATH`) | Creates a single instance of the SWEAT contract. A mix of FT transfers and batch minting with batch sizes comparable to mainnet observations in summer 2023. |
 | Sweat (storage stress test) | sweat.py | `--tags=storage-stress-test` <br> (`--sweat-wasm $WASM_PATH`) | Creates a single instance of the SWEAT contract. Sends maximally large batches to mint more tokens, thereby touching many storage nodes per receipt. This load will take a while to initialize enough Sweat users on chain. |
+| Sweat (claim) | sweat.py | `--tags=claim-test` <br> (`--sweat-wasm $WASM_PATH`) <br> (`--sweat-claim-wasm $WASM_PATH`) | Creates a single instance of the SWEAT and SWEAT.CLAIM contract. Sends deferred batches to mint more tokens, thereby touching many storage nodes per receipt. Then calls balance checks that iterate through populated state. |
 
 ## Notes on Storage Stress Test
 

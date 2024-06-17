@@ -21,6 +21,7 @@ base64.workspace = true
 clap.workspace = true
 once_cell.workspace = true
 opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 prometheus.workspace = true
@@ -50,6 +51,7 @@ nightly = [
   "nightly_protocol",
 ]
 io_trace = [ "near-fmt", "strum" ]
+sandbox = []
 
 [[bench]]
 name = "metrics"

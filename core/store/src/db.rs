@@ -5,6 +5,7 @@ use std::io;
 pub(crate) mod rocksdb;
 
 mod colddb;
+mod mixeddb;
 mod splitdb;
 
 pub mod refcount;
@@ -14,11 +15,13 @@ mod testdb;
 mod database_tests;
 
 pub use self::colddb::ColdDB;
+pub use self::mixeddb::{MixedDB, ReadOrder};
 pub use self::rocksdb::RocksDB;
 pub use self::splitdb::SplitDB;
 
 pub use self::slice::DBSlice;
 pub use self::testdb::TestDB;
+use std::sync::Arc;
 
 // `DBCol::BlockMisc` keys
 pub const HEAD_KEY: &[u8; 4] = b"HEAD";
@@ -39,6 +42,7 @@ pub const STATE_SNAPSHOT_KEY: &[u8; 18] = b"STATE_SNAPSHOT_KEY";
 pub const FLAT_STATE_VALUES_INLINING_MIGRATION_STATUS_KEY: &[u8] =
     b"FLAT_STATE_VALUES_INLINING_MIGRATION_STATUS";
 pub const STATE_TRANSITION_START_HEIGHTS: &[u8] = b"STATE_TRANSITION_START_HEIGHTS";
+pub const LATEST_WITNESSES_INFO: &[u8] = b"LATEST_WITNESSES_INFO";
 
 #[derive(Default, Debug)]
 pub struct DBTransaction {
@@ -71,6 +75,17 @@ impl DBOp {
             DBOp::Delete { col, .. } => col,
             DBOp::DeleteAll { col } => col,
             DBOp::DeleteRange { col, .. } => col,
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        match self {
+            DBOp::Set { key, value, .. } => key.len() + value.len(),
+            DBOp::Insert { key, value, .. } => key.len() + value.len(),
+            DBOp::UpdateRefcount { key, value, .. } => key.len() + value.len(),
+            DBOp::Delete { key, .. } => key.len(),
+            DBOp::DeleteAll { .. } => 0,
+            DBOp::DeleteRange { from, to, .. } => from.len() + to.len(),
         }
     }
 }
@@ -235,6 +250,12 @@ pub trait Database: Sync + Send {
         path: &std::path::Path,
         columns_to_keep: Option<&[DBCol]>,
     ) -> anyhow::Result<()>;
+
+    /// If this is a test database, return a copy of the entire database.
+    /// Otherwise return None.
+    fn copy_if_test(&self) -> Option<Arc<dyn Database>> {
+        None
+    }
 }
 
 fn assert_no_overwrite(col: DBCol, key: &[u8], value: &[u8], old_value: &[u8]) {
